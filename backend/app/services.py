@@ -1,0 +1,2749 @@
+import json
+import os
+import re
+import hashlib
+import shutil
+import subprocess
+from collections import Counter, defaultdict
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+from typing import Any, Optional
+from uuid import uuid4
+
+import httpx
+from docx import Document
+from openpyxl import load_workbook
+from pypdf import PdfReader
+from sqlalchemy import delete, func, or_, select
+from sqlalchemy.orm import Session
+
+from app import models
+from app.config import settings
+
+TENCENT_MEETING_SCRIPT = Path.home() / ".codex" / "skills" / "tencent-meeting-mcp" / "scripts" / "tencent_meeting.py"
+
+SUPPORTED_PROJECT_EXTS = {".pdf", ".docx", ".xlsx", ".txt", ".md", ".pptx", ".png", ".jpg", ".jpeg"}
+SUPPORTED_INBOX_EXTS = SUPPORTED_PROJECT_EXTS | {".zip", ".rar", ".7z", ".dwg", ".skp", ".rvt", ".csv", ".webp", ".mp3", ".m4a", ".wav", ".mp4"}
+SUPPORTED_KNOWLEDGE_EXTS = {".md", ".txt", ".pdf", ".docx", ".xlsx", ".pptx", ".png", ".jpg", ".jpeg"}
+MAX_BROWSER_UPLOAD_SIZE = 25 * 1024 * 1024
+DEFAULT_VAULT_EXCLUDE_DIRS = {
+    ".git",
+    ".obsidian",
+    ".venv",
+    ".venv-funasr",
+    "__pycache__",
+    "node_modules",
+    "dist",
+    ".cache",
+}
+DEFAULT_VAULT_EXCLUDE_EXTS = {
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".zip",
+    ".rar",
+    ".7z",
+    ".psd",
+    ".dwg",
+    ".bak",
+}
+DEFAULT_VAULT_MAX_FILE_SIZE = 30 * 1024 * 1024
+KNOWLEDGE_OVERVIEW_TRIGGERS = ("知识库里有什么", "知识库有什么", "有什么资料", "资料概览", "知识库概览", "总结知识库")
+
+DIGITAL_EMPLOYEES = [
+    ("AI项目经理", "项目负责人 / PM", ["任务拆解", "进度协调", "风险跟踪"], "PM"),
+    ("AI总图助理", "总图负责人", ["强排", "流线", "指标复核"], "MP"),
+    ("AI户型助理", "户型负责人", ["产品定位", "户型推演", "得房率"], "UN"),
+    ("AI立面助理", "立面负责人", ["风格研究", "材料策略", "比例控制"], "FC"),
+    ("AI景观助理", "景观接口", ["景观节点", "归家动线", "界面协同"], "LS"),
+    ("AI室内助理", "室内接口", ["大堂", "会所", "精装氛围"], "IN"),
+    ("AI汇报助理", "汇报助理", ["PPT目录", "汇报文案", "图像提示词"], "RP"),
+    ("AI资料管理员", "资料管理员", ["文件整理", "知识库引用", "版本记录"], "KB"),
+]
+
+
+def parse_tencent_meeting_result(text: str) -> dict[str, str]:
+    text = text.replace("\\n", "\n")
+    code_match = re.search(r"(?:会议号|meeting_code|meeting code)\s*[：:]\s*([0-9\s-]{9,})", text, re.I)
+    url_match = re.search(r"https://meeting\.tencent\.com/[^\\\s，。)）]+", text)
+    trace_match = re.search(r"(?:X-Tc-Trace|rpcUuid)\s*[：:]\s*([^\s，。]+)", text, re.I)
+    meeting_id_match = re.search(r"(?:meeting_id|会议ID|会议id)\s*[：:]\s*([0-9]+)", text, re.I)
+    return {
+        "meeting_code": re.sub(r"\D", "", code_match.group(1)) if code_match else "",
+        "join_url": url_match.group(0) if url_match else "",
+        "trace": trace_match.group(1) if trace_match else "",
+        "meeting_id": meeting_id_match.group(1) if meeting_id_match else "",
+        "raw": text,
+    }
+
+
+def parse_tencent_record_result(text: str) -> dict[str, str]:
+    text = text.replace("\\n", "\n")
+    record_file_match = re.search(r"(?:record_file_id|recordFileId|录制文件ID|录制文件id)\s*[：:]\s*([0-9]+)", text, re.I)
+    meeting_record_match = re.search(r"(?:meeting_record_id|meetingRecordId|会议录制ID|会议录制id)\s*[：:]\s*([0-9]+)", text, re.I)
+    download_match = re.search(r"https?://[^\\\s，。)）]+", text)
+    return {
+        "record_file_id": record_file_match.group(1) if record_file_match else "",
+        "meeting_record_id": meeting_record_match.group(1) if meeting_record_match else "",
+        "download_url": download_match.group(0) if download_match else "",
+        "raw": text,
+    }
+
+
+def extract_tencent_meeting_metadata(meeting: models.Meeting) -> dict[str, str]:
+    return parse_tencent_meeting_result("\n".join([meeting.recording_url or "", meeting.agenda or ""]))
+
+
+def call_tencent_meeting_tool(name: str, arguments: dict[str, Any], timeout: int = 60) -> str:
+    token = (settings.tencent_meeting_token or os.environ.get("TENCENT_MEETING_TOKEN", "")).strip()
+    if not token:
+        raise RuntimeError("TENCENT_MEETING_TOKEN 未配置")
+    if not TENCENT_MEETING_SCRIPT.exists():
+        raise RuntimeError("腾讯会议 skill 未安装")
+    payload = {
+        "name": name,
+        "arguments": {
+            **arguments,
+            "_client_info": {"os": "macos", "agent": "codex-rom-ai", "model": "gpt-5-codex"},
+        },
+    }
+    result = subprocess.run(
+        ["python3", str(TENCENT_MEETING_SCRIPT), "tools/call", json.dumps(payload, ensure_ascii=False)],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        env={**os.environ, "TENCENT_MEETING_TOKEN": token},
+    )
+    output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+    if result.returncode != 0 or "[错误]" in output:
+        raise RuntimeError(output.strip() or "腾讯会议创建失败")
+    return output
+
+
+def schedule_tencent_meeting(subject: str, start_time: str, end_time: str) -> dict[str, str]:
+    output = call_tencent_meeting_tool(
+        "schedule_meeting",
+        {
+            "subject": subject,
+            "start_time": start_time,
+            "end_time": end_time,
+            "time_zone": "Asia/Shanghai",
+        },
+    )
+    return parse_tencent_meeting_result(output)
+
+
+def build_tencent_records_query(meeting: models.Meeting) -> dict[str, Any]:
+    metadata = extract_tencent_meeting_metadata(meeting)
+    records_args: dict[str, Any] = {"page_size": 10}
+    if metadata.get("meeting_id"):
+        records_args["meeting_id"] = metadata["meeting_id"]
+    elif metadata.get("meeting_code"):
+        records_args["meeting_code"] = metadata["meeting_code"]
+    elif meeting.date:
+        start = meeting.date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = meeting.date.replace(hour=23, minute=59, second=59, microsecond=0)
+        records_args["start_time"] = f"{start.isoformat()}+08:00"
+        records_args["end_time"] = f"{end.isoformat()}+08:00"
+    else:
+        raise RuntimeError("会议卡片里没有腾讯会议号或会议时间，无法同步录制和转写")
+    return records_args
+
+
+def sync_tencent_meeting_minutes(db: Session, meeting: models.Meeting) -> models.Meeting:
+    records_args = build_tencent_records_query(meeting)
+    records_text = call_tencent_meeting_tool("get_records_list", records_args)
+    record = parse_tencent_record_result(records_text)
+    record_file_id = record.get("record_file_id")
+    if not record_file_id:
+        raise RuntimeError("暂未查询到腾讯会议录制文件，请确认会议已结束并已开启云录制/转写")
+
+    smart_minutes = ""
+    transcript = ""
+    try:
+        smart_minutes = call_tencent_meeting_tool("get_smart_minutes", {"record_file_id": record_file_id})
+    except Exception:
+        smart_minutes = ""
+    try:
+        transcript = call_tencent_meeting_tool("get_transcripts_details", {"record_file_id": record_file_id, "pid": "0", "limit": "50"})
+    except Exception:
+        transcript = ""
+    if not smart_minutes and not transcript:
+        raise RuntimeError("腾讯会议纪要或转写暂未生成，请稍后再同步")
+
+    meeting.transcript = transcript or smart_minutes
+    meeting.summary = smart_minutes or transcript
+    link_parts = [meeting.recording_url or ""]
+    if record.get("meeting_record_id"):
+        link_parts.append(f"meeting_record_id：{record['meeting_record_id']}")
+    if record_file_id:
+        link_parts.append(f"record_file_id：{record_file_id}")
+    if record.get("download_url"):
+        link_parts.append(f"录制下载：{record['download_url']}")
+    meeting.recording_url = "\n".join(part for part in link_parts if part).strip()
+    meeting.status = "summarized"
+    db.commit()
+    db.refresh(meeting)
+    return meeting
+
+TEAM_MEMBERS = [
+    ("项目经理", "项目负责人", ["业主沟通", "会议推进", "任务协调"], 45),
+    ("主创负责人", "主创设计师", ["概念判断", "方案把控", "评审"], 55),
+    ("总图负责人", "总图负责人", ["强排", "指标复核", "退界"], 50),
+    ("立面负责人", "立面负责人", ["风格研究", "材料策略", "比例控制"], 35),
+    ("汇报负责人", "汇报助理", ["PPT结构", "文本组织", "成果整合"], 40),
+]
+
+
+def ensure_digital_employees(db: Session) -> None:
+    existing_names = set(db.scalars(select(models.DigitalEmployee.name)))
+    target_names = {item[0] for item in DIGITAL_EMPLOYEES}
+    if target_names.issubset(existing_names):
+        return
+    db.execute(delete(models.DigitalEmployee))
+    for name, role, skills, avatar in DIGITAL_EMPLOYEES:
+        db.add(
+            models.DigitalEmployee(
+                name=name,
+                role=role,
+                skills=json.dumps(skills, ensure_ascii=False),
+                avatar=avatar,
+                status="available",
+                workload=20,
+            )
+        )
+    db.commit()
+
+
+def ensure_team_members(db: Session) -> None:
+    existing_names = set(db.scalars(select(models.TeamMember.name)))
+    if existing_names:
+        return
+    for name, role, skills, workload in TEAM_MEMBERS:
+        db.add(
+            models.TeamMember(
+                name=name,
+                role=role,
+                skills=json.dumps(skills, ensure_ascii=False),
+                status="available",
+                workload=workload,
+            )
+        )
+    db.commit()
+
+
+def parse_document(path: Path) -> tuple[str, str]:
+    ext = path.suffix.lower()
+    try:
+        if ext in {".png", ".jpg", ".jpeg"}:
+            return "", "saved_no_ocr"
+        if ext in {".txt", ".md"}:
+            return path.read_text(encoding="utf-8", errors="ignore"), "parsed"
+        if ext == ".pdf":
+            reader = PdfReader(str(path))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+            return text, "parsed"
+        if ext == ".docx":
+            doc = Document(str(path))
+            text = "\n".join(p.text for p in doc.paragraphs)
+            return text, "parsed"
+        if ext == ".xlsx":
+            wb = load_workbook(str(path), read_only=True, data_only=True)
+            rows = []
+            for ws in wb.worksheets:
+                rows.append(f"# Sheet: {ws.title}")
+                for row in ws.iter_rows(values_only=True):
+                    values = [str(value) for value in row if value is not None]
+                    if values:
+                        rows.append(" | ".join(values))
+            return "\n".join(rows), "parsed"
+        if ext == ".pptx":
+            try:
+                from pptx import Presentation
+            except Exception as exc:
+                return f"解析失败：缺少 python-pptx（{exc}）", "failed"
+            prs = Presentation(str(path))
+            slides = []
+            for idx, slide in enumerate(prs.slides, start=1):
+                slides.append(f"# Slide {idx}")
+                for shape in slide.shapes:
+                    text = getattr(shape, "text", "")
+                    if text:
+                        slides.append(text)
+            return "\n".join(slides), "parsed"
+        return "", "unsupported"
+    except Exception as exc:
+        return f"解析失败：{exc}", "failed"
+
+
+def project_upload_dir(project_id: str) -> Path:
+    path = settings.upload_root_path / "projects" / project_id
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def project_managed_dir(project_id: str, upload_root: Optional[Path] = None) -> Path:
+    root = upload_root or settings.upload_root_path
+    return root / "projects" / project_id
+
+
+def inbox_upload_dir() -> Path:
+    path = settings.upload_root_path / "inbox"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def delete_project_library(db: Session, project_id: str, upload_root: Optional[Path] = None) -> dict[str, Any]:
+    project = db.get(models.Project, project_id)
+    if not project:
+        return {"deleted": False, "deleted_project_id": project_id, "deleted_files": 0}
+    managed_dir = project_managed_dir(project_id, upload_root)
+    deleted_files = len(project.files)
+    inbox_items = list(db.scalars(select(models.InboxItem).where(models.InboxItem.project_id == project_id)))
+    for item in inbox_items:
+        item.project_id = ""
+        item.archive_path = ""
+        item.status = "待确认"
+        item.archive_group = "待确认"
+        item.needs_review = True
+    db.delete(project)
+    db.commit()
+    if managed_dir.exists() and managed_dir.is_dir():
+        shutil.rmtree(managed_dir, ignore_errors=True)
+    return {"deleted": True, "deleted_project_id": project_id, "deleted_files": deleted_files}
+
+
+def _unique_path(directory: Path, filename: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(filename).name or "uploaded-file"
+    candidate = directory / safe_name
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem
+    suffix = candidate.suffix
+    for index in range(2, 1000):
+        next_candidate = directory / f"{stem}_{index}{suffix}"
+        if not next_candidate.exists():
+            return next_candidate
+    return directory / f"{stem}_{uuid4().hex[:8]}{suffix}"
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def create_inbox_item_from_path(db: Session, source_path: Path, target_dir: Optional[Path] = None, source_label: str = "本地路径") -> models.InboxItem:
+    source_path = source_path.expanduser().resolve()
+    if not source_path.exists() or not source_path.is_file():
+        raise FileNotFoundError(f"文件不存在：{source_path}")
+    ext = source_path.suffix.lower()
+    if ext not in SUPPORTED_INBOX_EXTS:
+        raise ValueError(f"不支持的文件类型：{source_path.name}")
+    target = _unique_path(target_dir or inbox_upload_dir(), source_path.name)
+    shutil.copy2(source_path, target)
+    item = models.InboxItem(
+        original_filename=source_path.name,
+        suggested_filename=source_path.name,
+        final_filename="",
+        source_path=str(source_path),
+        temp_path=str(target),
+        source_label=source_label,
+        status="待确认",
+        needs_review=True,
+        file_hash=file_sha256(target),
+        archive_group="待确认",
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def run_inbox_scan_with_progress(
+    db: Session,
+    root: Path,
+    source_label: str,
+    days: int = 0,
+    progress: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    root = root.expanduser()
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(f"目录不存在：{root}")
+    cutoff = datetime.now().timestamp() - (days * 24 * 60 * 60) if days and days > 0 else 0
+    if progress is not None:
+        progress.update(
+            {
+                "status": "running",
+                "step": "枚举文件",
+                "total_candidates": 0,
+                "processed": 0,
+                "imported_files": 0,
+                "unsupported_files": 0,
+                "old_files": 0,
+                "failed_files": 0,
+                "current_file": "",
+            }
+        )
+
+    candidates: list[Path] = []
+    unsupported = 0
+    old_files = 0
+    for path in sorted(root.rglob("*"), key=lambda item: item.stat().st_mtime if item.exists() else 0, reverse=True):
+        if len(candidates) >= 200:
+            break
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in SUPPORTED_INBOX_EXTS:
+            unsupported += 1
+            continue
+        if path.stat().st_mtime < cutoff:
+            old_files += 1
+            continue
+        candidates.append(path)
+
+    if progress is not None:
+        progress.update(
+            {
+                "step": "复制并识别",
+                "total_candidates": len(candidates),
+                "unsupported_files": unsupported,
+                "old_files": old_files,
+            }
+        )
+
+    imported: list[models.InboxItem] = []
+    failed: list[str] = []
+    for index, path in enumerate(candidates, start=1):
+        if progress is not None:
+            progress.update({"processed": index, "current_file": path.name, "step": "复制到收件箱"})
+        try:
+            item = create_inbox_item_from_path(db, path, inbox_upload_dir(), source_label)
+            if progress is not None:
+                progress.update({"step": "识别项目和资料类型"})
+            imported.append(classify_inbox_item(db, item))
+            if progress is not None:
+                progress["imported_files"] = len(imported)
+        except Exception as exc:
+            failed.append(f"{path.name}：{exc}")
+            if progress is not None:
+                progress["failed_files"] = len(failed)
+
+    if not imported:
+        detail = f"未导入文件。目录中不支持格式 {unsupported} 个"
+        if old_files:
+            detail += f"，超过时间范围 {old_files} 个"
+        if failed:
+            detail += "，失败：" + "；".join(failed[:5])
+        raise ValueError(detail)
+
+    if progress is not None:
+        progress.update({"step": "生成整体建议", "current_file": ""})
+    advice = build_inbox_batch_advice(db, [item.id for item in imported])
+    result = {
+        "imported_count": len(imported),
+        "items": imported,
+        "unsupported_files": unsupported,
+        "old_files": old_files,
+        "failed_files": failed,
+        "batch_advice": advice,
+    }
+    if progress is not None:
+        progress.update(
+            {
+                "status": "succeeded",
+                "step": "完成",
+                "processed": len(candidates),
+                "current_file": "",
+                "result": {
+                    "imported_count": len(imported),
+                    "unsupported_files": unsupported,
+                    "old_files": old_files,
+                    "failed_count": len(failed),
+                    "batch_advice": advice,
+                },
+            }
+        )
+    return result
+
+
+def _read_small_context(path: Path, limit: int = 4000) -> str:
+    if path.suffix.lower() not in SUPPORTED_PROJECT_EXTS:
+        return ""
+    text, status = parse_document(path)
+    if status != "parsed":
+        return ""
+    return text[:limit]
+
+
+def _pick_material_type(text: str, ext: str) -> tuple[str, list[str]]:
+    rules = [
+        ("会议资料", ["会议纪要", "参会人", "议题", "会议录音", "转写", "启动会"]),
+        ("技术条件", ["日照", "退界", "容积率", "消防", "规划条件", "人防", "绿建", "管线"]),
+        ("参考案例", ["竞品", "案例", "参考", "市场定位"]),
+        ("审核反馈", ["甲方意见", "修改意见", "审核", "反馈", "批注", "问题清单"]),
+        ("交付成果", ["汇报", "提案", "投标", "正式提交", "盖章版", "交付"]),
+        ("项目基础资料", ["设计任务书", "红线", "面积表", "合同", "甲方需求", "用地"]),
+    ]
+    if ext in {".zip", ".rar", ".7z"}:
+        return "压缩包与杂项", ["压缩包待确认"]
+    if ext in {".dwg", ".skp", ".rvt"}:
+        return "设计源文件", ["设计源文件仅登记资产"]
+    if ext in {".png", ".jpg", ".jpeg", ".webp"}:
+        return "设计过程", ["图片资料默认先做项目资产"]
+    for material_type, keywords in rules:
+        hits = [word for word in keywords if word in text]
+        if hits:
+            return material_type, hits
+    if ext in {".pptx", ".pdf"}:
+        return "设计过程", ["按文件类型判断"]
+    return "项目基础资料", ["默认归入基础资料"]
+
+
+PROJECT_TOPIC_WORDS = {
+    "项目汇报",
+    "汇报",
+    "方案设计",
+    "概念方案设计",
+    "概念方案",
+    "方案",
+    "定位报告",
+    "总图及户型",
+    "总图",
+    "户型",
+    "附件",
+    "配套",
+    "竞品",
+    "集",
+    "最终版",
+    "新定案",
+}
+
+
+def _strip_project_topic_words(text: str) -> str:
+    value = re.sub(r"\.[^.]+$", "", text)
+    value = re.sub(r"20\d{2}[-年.]?\d{1,2}[-月.]?\d{0,2}日?", "", value)
+    value = re.sub(r"26\d{4}", "", value)
+    value = re.sub(r"0115|0103|0114|0118|V\d+|v\d+", "", value)
+    value = re.sub(r"附件\s*\d*[：:、-]?", "", value)
+    value = re.sub(r"[（(][^）)]*[）)]", "", value)
+    for word in sorted(PROJECT_TOPIC_WORDS, key=len, reverse=True):
+        value = value.replace(word, "")
+    value = re.sub(r"[_\-\s]+", "", value)
+    value = re.sub(r"[：:、，,。]+", "", value)
+    return value.strip()
+
+
+def _canonical_project_name_from_text(filename: str, context: str = "") -> str:
+    haystack = f"{filename}\n{context}"
+    if "振三街" in haystack:
+        if "石家庄" in haystack:
+            return "石家庄市振三街地块项目"
+        return "振三街项目"
+    patterns = [
+        r"([\u4e00-\u9fa5]{2,12}(?:市|区|县)?[\u4e00-\u9fa5A-Za-z0-9]{1,18}(?:地块|项目))",
+        r"([\u4e00-\u9fa5A-Za-z0-9]{2,24}(?:项目|地块))",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, haystack)
+        if match:
+            candidate = _strip_project_topic_words(match.group(1))
+            if candidate:
+                if candidate.endswith("地块"):
+                    return f"{candidate}项目"
+                return candidate[:32]
+    stem = Path(filename).stem
+    cleaned = _strip_project_topic_words(stem)
+    parts = [part for part in re.split(r"[_\-\s]+", cleaned) if part]
+    stop_words = {"启动会", "会议纪要", "规划条件", "日照退界", "日照分析", "设计任务书"}
+    useful = [part for part in parts if part not in stop_words]
+    return (useful[0] if useful else cleaned or stem)[:32]
+
+
+def _extract_project_hint(filename: str, context: str = "") -> str:
+    return _canonical_project_name_from_text(filename, context)
+
+
+def _extract_date_token(text: str) -> str:
+    match = re.search(r"(20\d{2})[-年.]?(\d{1,2})[-月.]?(\d{1,2})?", text)
+    if not match:
+        return datetime.now().strftime("%Y%m%d")
+    year, month, day = match.group(1), match.group(2), match.group(3) or "01"
+    return f"{year}{int(month):02d}{int(day):02d}"
+
+
+def _safe_filename_part(text: str, fallback: str = "资料") -> str:
+    value = re.sub(r"[\\/:*?\"<>|\s]+", "", text or "")
+    return value[:32] or fallback
+
+
+KNOWLEDGE_RECOMMENDED_TYPES = {"技术条件", "会议资料", "审核反馈", "项目基础资料", "参考案例", "复盘沉淀"}
+KNOWLEDGE_SKIPPED_REASONS = {
+    "设计源文件": "设计源文件默认只做项目资产记录。",
+    "压缩包与杂项": "压缩包与杂项默认只做项目资产记录。",
+    "设计过程": "设计过程稿默认先归档到项目，确认为可复用成果后再入知识库。",
+}
+
+
+def _knowledge_recommendation(material_type: str, filename: str = "", text: str = "") -> tuple[bool, str]:
+    haystack = f"{filename}\n{text}"
+    if material_type in {"设计源文件", "压缩包与杂项", "设计过程"}:
+        return False, KNOWLEDGE_SKIPPED_REASONS.get(material_type, "该资料默认只归档到项目。")
+    project_specific_words = ["项目汇报", "方案设计", "概念方案", "总图", "户型", "阶段性方案", "汇报稿"]
+    reusable_rules = [
+        ("规划条件", "包含规划条件，具备跨项目复用价值，可供后续项目参考。"),
+        ("退界", "包含退界要求，具备跨项目复用价值，可供后续项目参考。"),
+        ("日照", "包含日照要求，具备跨项目复用价值，可供后续项目参考。"),
+        ("消防", "包含消防条件，具备跨项目复用价值，可供后续项目参考。"),
+        ("人防", "包含人防条件，具备跨项目复用价值，可供后续项目参考。"),
+        ("绿建", "包含绿建要求，具备跨项目复用价值，可供后续项目参考。"),
+        ("建筑面积计算规则", "包含地方规则或面积计算规则，建议进入知识库。"),
+        ("会议结论", "包含会议结论，建议进入知识库。"),
+        ("审核意见", "包含审核意见，建议进入知识库。"),
+        ("甲方反馈", "包含甲方反馈，建议进入知识库。"),
+        ("复盘", "包含复盘方法，建议进入知识库。"),
+        ("竞品", "包含竞品或市场定位结论，建议进入知识库。"),
+        ("市场定位", "包含竞品或市场定位结论，建议进入知识库。"),
+        ("定位报告", "包含竞品或市场定位结论，建议进入知识库。"),
+    ]
+    if any(word in filename for word in project_specific_words):
+        if any(word in haystack for word in ["规划条件", "建筑面积计算规则", "审核意见", "甲方反馈", "会议结论", "复盘", "竞品", "市场定位", "定位报告"]):
+            for word, reason in reusable_rules:
+                if word in haystack:
+                    return True, f"建议入库：{reason}"
+        return False, "仅项目归档：这是本项目阶段性方案或汇报资料，复用价值有限。"
+    for word, reason in reusable_rules:
+        if word in haystack:
+            return True, f"建议入库：{reason}"
+    if material_type in {"会议资料", "审核反馈", "参考案例"}:
+        return True, f"建议入库：{material_type}通常具备复用价值。"
+    return False, "仅项目归档：未识别到明确可复用的技术条件、反馈、复盘或规则内容。"
+
+
+def _same_file_hash(path: str, expected_hash: str) -> bool:
+    if not path or not expected_hash:
+        return False
+    candidate = Path(path)
+    if not candidate.exists() or not candidate.is_file():
+        return False
+    try:
+        return file_sha256(candidate) == expected_hash
+    except Exception:
+        return False
+
+
+def _detect_duplicate(db: Session, item: models.InboxItem) -> tuple[str, str, str]:
+    file_hash = item.file_hash or (file_sha256(Path(item.temp_path)) if item.temp_path else "")
+    if not file_hash:
+        return "", "", ""
+    for project_file in db.scalars(select(models.ProjectFile)):
+        if _same_file_hash(project_file.filepath, file_hash):
+            return "project", project_file.id, ""
+    for knowledge_file in db.scalars(select(models.KnowledgeFile)):
+        if _same_file_hash(knowledge_file.filepath, file_hash):
+            return "knowledge", "", knowledge_file.id
+    return "", "", ""
+
+
+def recommend_inbox_item(db: Session, item: models.InboxItem) -> models.InboxItem:
+    if item.temp_path and Path(item.temp_path).exists():
+        item.file_hash = item.file_hash or file_sha256(Path(item.temp_path))
+    duplicate_scope, duplicate_project_file_id, duplicate_knowledge_file_id = _detect_duplicate(db, item)
+    item.duplicate_scope = duplicate_scope
+    item.duplicate_project_file_id = duplicate_project_file_id
+    item.duplicate_knowledge_file_id = duplicate_knowledge_file_id
+    if duplicate_scope:
+        item.status = "重复文件"
+        item.archive_group = "重复文件"
+        item.recommended_action = "重复跳过"
+        item.suggest_knowledge = False
+        item.recommend_knowledge_reason = "项目库或知识库已存在相同文件，默认跳过。"
+        item.needs_review = True
+        db.commit()
+        db.refresh(item)
+        return item
+
+    suggest_knowledge, reason = _knowledge_recommendation(item.material_type, item.original_filename, item.summary)
+    item.suggest_knowledge = suggest_knowledge
+    item.recommend_knowledge_reason = reason
+    if item.project_id and item.confidence >= 0.85:
+        item.archive_group = "可直接确认"
+        item.recommended_action = "入知识库" if suggest_knowledge else "仅项目归档"
+        item.status = "待确认"
+        item.needs_review = False
+    elif not item.project_id:
+        item.archive_group = "未归属项目"
+        item.recommended_action = "创建新项目"
+        item.status = "未归属项目"
+        item.needs_review = True
+    else:
+        item.archive_group = "需审核"
+        item.recommended_action = "需人工确认"
+        item.status = "需审核"
+        item.needs_review = True
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def classify_inbox_item(db: Session, item: models.InboxItem) -> models.InboxItem:
+    path = Path(item.temp_path)
+    ext = path.suffix.lower()
+    context = _read_small_context(path)
+    haystack = f"{item.original_filename}\n{context}"
+    projects = list(db.scalars(select(models.Project).order_by(models.Project.updated_at.desc())))
+    matched_project = None
+    evidence: list[str] = []
+    confidence = 0.35
+    for project in projects:
+        if project.name and project.name in haystack:
+            matched_project = project
+            evidence.append(f"文件名或内容包含项目名：{project.name}")
+            confidence = 0.92
+            break
+        if project.city and project.city in haystack and project.phase and project.phase in haystack:
+            matched_project = project
+            evidence.append(f"同时匹配城市和阶段：{project.city}/{project.phase}")
+            confidence = 0.72
+            break
+
+    material_type, keyword_hits = _pick_material_type(haystack, ext)
+    evidence.extend([f"关键词：{word}" for word in keyword_hits[:4]])
+    project_name = matched_project.name if matched_project else _extract_project_hint(item.original_filename, context)
+    phase = matched_project.phase if matched_project else ("强排" if "强排" in haystack else "待确认")
+    topic = keyword_hits[0] if keyword_hits else Path(item.original_filename).stem[:12]
+    date_token = _extract_date_token(item.original_filename)
+    suggested_filename = "_".join(
+        [
+            _safe_filename_part(project_name, "未归属项目"),
+            _safe_filename_part(material_type),
+            _safe_filename_part(topic),
+            _safe_filename_part(phase),
+            date_token,
+            "V1",
+        ]
+    ) + ext
+
+    item.project_id = matched_project.id if matched_project else ""
+    item.suggested_project_name = project_name
+    item.suggested_city = matched_project.city if matched_project else ""
+    item.suggested_project_type = matched_project.project_type if matched_project else ""
+    item.suggested_phase = phase
+    item.material_type = material_type
+    item.summary = (context.strip().replace("\n", " ")[:180] if context else f"{material_type}文件，等待人工确认归档。")
+    item.keywords = json.dumps(keyword_hits, ensure_ascii=False)
+    item.evidence = "；".join(evidence)
+    item.confidence = confidence
+    item.status = "待确认" if matched_project else "未归属项目"
+    item.needs_review = confidence < 0.85 or not matched_project
+    suggest_knowledge, knowledge_reason = _knowledge_recommendation(material_type, item.original_filename, context)
+    item.suggest_knowledge = suggest_knowledge
+    item.recommend_knowledge_reason = knowledge_reason
+    item.suggest_todo = material_type in {"会议资料", "审核反馈"}
+    item.suggested_filename = suggested_filename
+    if path.exists():
+        item.file_hash = item.file_hash or file_sha256(path)
+    db.commit()
+    db.refresh(item)
+    return recommend_inbox_item(db, item)
+
+
+def delete_inbox_items(db: Session, item_ids: list[str]) -> int:
+    items = list(db.scalars(select(models.InboxItem).where(models.InboxItem.id.in_(item_ids))))
+    for item in items:
+        path = Path(item.temp_path) if item.temp_path else None
+        if path and path.exists() and path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        db.delete(item)
+    db.commit()
+    return len(items)
+
+
+def apply_inbox_items(
+    db: Session,
+    item_ids: list[str],
+    project_id: str = "",
+    project_payload: Optional[Any] = None,
+    final_filename_by_id: Optional[dict[str, str]] = None,
+    material_type_by_id: Optional[dict[str, str]] = None,
+    enter_knowledge: bool = False,
+    enter_knowledge_by_id: Optional[dict[str, bool]] = None,
+    archive_root: Optional[Path] = None,
+) -> dict[str, Any]:
+    items = list(db.scalars(select(models.InboxItem).where(models.InboxItem.id.in_(item_ids))))
+    if not items:
+        raise ValueError("没有找到可归档的收件箱文件")
+    project = db.get(models.Project, project_id) if project_id else None
+    if not project:
+        if project_payload is None:
+            first = items[0]
+            project_payload = type("ProjectPayload", (), {
+                "name": first.suggested_project_name or "未命名项目",
+                "city": first.suggested_city,
+                "project_type": first.suggested_project_type,
+                "phase": first.suggested_phase,
+                "description": "由文件收件箱创建",
+                "status": "active",
+            })()
+        if hasattr(project_payload, "model_dump"):
+            data = project_payload.model_dump()
+        elif isinstance(project_payload, dict):
+            data = project_payload
+        else:
+            data = {
+                "name": getattr(project_payload, "name", "未命名项目"),
+                "city": getattr(project_payload, "city", ""),
+                "project_type": getattr(project_payload, "project_type", ""),
+                "phase": getattr(project_payload, "phase", ""),
+                "description": getattr(project_payload, "description", ""),
+                "status": getattr(project_payload, "status", "active"),
+            }
+        project = models.Project(**data)
+        db.add(project)
+        db.commit()
+        db.refresh(project)
+
+    target_dir = archive_root or project_upload_dir(project.id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    final_filename_by_id = final_filename_by_id or {}
+    material_type_by_id = material_type_by_id or {}
+    files: list[models.ProjectFile] = []
+    for item in items:
+        final_name = Path(final_filename_by_id.get(item.id) or item.suggested_filename or item.original_filename).name
+        if not Path(final_name).suffix:
+            final_name += Path(item.original_filename).suffix
+        target = _unique_path(target_dir, final_name)
+        shutil.copy2(Path(item.temp_path), target)
+        text, parse_status = parse_document(target) if target.suffix.lower() in SUPPORTED_PROJECT_EXTS else ("", "saved_no_parse")
+        record = models.ProjectFile(
+            project_id=project.id,
+            filename=target.name,
+            filepath=str(target),
+            filetype=target.suffix.lower().lstrip("."),
+            filesize=target.stat().st_size,
+            parsed_text=text,
+            parse_status=parse_status,
+            analysis_status="pending",
+        )
+        db.add(record)
+        files.append(record)
+        item.project_id = project.id
+        item.final_filename = target.name
+        item.archive_path = str(target)
+        item.material_type = material_type_by_id.get(item.id, item.material_type)
+        item.status = "已归档"
+        item.needs_review = False
+        should_enter_knowledge = enter_knowledge or bool((enter_knowledge_by_id or {}).get(item.id))
+        if should_enter_knowledge:
+            index_knowledge_file(db, target, display_path=f"projects/{project.id}/{target.name}")
+            item.status = "已进入知识库"
+        item.archive_group = item.status
+    db.commit()
+    for file in files:
+        db.refresh(file)
+    for item in items:
+        db.refresh(item)
+    db.refresh(project)
+    return {"project": project, "files": files, "items": items}
+
+
+def apply_inbox_recommendations(
+    db: Session,
+    item_ids: list[str],
+    force_duplicate_ids: Optional[list[str]] = None,
+    archive_root: Optional[Path] = None,
+) -> dict[str, Any]:
+    force_duplicate_ids = force_duplicate_ids or []
+    items = list(db.scalars(select(models.InboxItem).where(models.InboxItem.id.in_(item_ids))))
+    files: list[models.ProjectFile] = []
+    changed_items: list[models.InboxItem] = []
+    skipped_count = 0
+    created_project_count = 0
+    actionable_groups: dict[tuple[str, str, str], list[models.InboxItem]] = defaultdict(list)
+    batch_keys = _batch_project_group_keys(items)
+    for item in items:
+        item = recommend_inbox_item(db, item)
+        if item.archive_group == "重复文件" and item.id not in force_duplicate_ids:
+            skipped_count += 1
+            changed_items.append(item)
+            continue
+        if item.recommended_action == "需人工确认":
+            skipped_count += 1
+            changed_items.append(item)
+            continue
+        actionable_groups[batch_keys.get(item.id, _item_project_group_key(item))].append(item)
+
+    for group_key, group_items in actionable_groups.items():
+        kind, _, project_name = group_key
+        project_id = group_items[0].project_id if kind == "existing" else ""
+        payload = None
+        if not project_id:
+            payload = type("ProjectPayload", (), {
+                "name": project_name or "未命名项目",
+                "city": group_items[0].suggested_city,
+                "project_type": group_items[0].suggested_project_type or "住宅",
+                "phase": group_items[0].suggested_phase or "待确认",
+                "description": f"由文件收件箱根据 {len(group_items)} 个资料创建",
+                "status": "active",
+            })()
+        result = apply_inbox_items(
+            db,
+            [item.id for item in group_items],
+            project_id=project_id,
+            project_payload=payload,
+            enter_knowledge_by_id={item.id: item.suggest_knowledge for item in group_items},
+            archive_root=archive_root,
+        )
+        files.extend(result["files"])
+        changed_items.extend(result["items"])
+        if not project_id and result["project"].id:
+            created_project_count += 1
+    return {
+        "files": files,
+        "items": changed_items,
+        "skipped_count": skipped_count,
+        "created_project_count": created_project_count,
+    }
+
+
+def _item_project_group_key(item: models.InboxItem) -> tuple[str, str, str]:
+    if item.project_id:
+        return ("existing", item.project_id, item.suggested_project_name or "已有项目")
+    canonical = _canonical_project_name_from_text(item.original_filename, item.summary)
+    return ("new", canonical or item.suggested_project_name or "未命名项目", canonical or item.suggested_project_name or "未命名项目")
+
+
+def _project_signature(name: str) -> str:
+    if "振三街" in name:
+        return "振三街"
+    value = re.sub(r"(?:^.*市|^.*区|^.*县)", "", name)
+    value = re.sub(r"(项目|地块)$", "", value)
+    return value or name
+
+
+def _batch_project_group_keys(items: list[models.InboxItem]) -> dict[str, tuple[str, str, str]]:
+    raw_keys = {item.id: _item_project_group_key(item) for item in items}
+    by_signature: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+    for key in raw_keys.values():
+        kind, project_key, project_name = key
+        if kind == "new":
+            by_signature[_project_signature(project_name)].append(key)
+    preferred_by_signature: dict[str, tuple[str, str, str]] = {}
+    for signature, keys in by_signature.items():
+        preferred = sorted(set(keys), key=lambda key: (len(key[2]), "市" in key[2], "地块" in key[2]), reverse=True)[0]
+        preferred_by_signature[signature] = preferred
+    return {
+        item_id: preferred_by_signature.get(_project_signature(key[2]), key) if key[0] == "new" else key
+        for item_id, key in raw_keys.items()
+    }
+
+
+def _build_inbox_advice_markdown(
+    total_files: int,
+    action_counts: dict[str, int],
+    project_groups: list[dict[str, Any]],
+    knowledge_candidates: list[dict[str, str]],
+    duplicates: list[dict[str, str]],
+    needs_review: list[dict[str, str]],
+) -> str:
+    lines = [
+        f"本次收件箱共有 {total_files} 个文件。",
+        f"建议直接归档 {action_counts['归档文件']} 个，其中需要创建新项目 {action_counts['创建项目']} 个，建议进入知识库 {action_counts['入知识库']} 个。",
+    ]
+    if duplicates:
+        lines.append(f"发现 {len(duplicates)} 个重复文件，默认跳过，避免重复进入项目库或知识库。")
+    if needs_review:
+        lines.append(f"还有 {len(needs_review)} 个文件需要人工看一眼，主要是项目归属或资料类型不够确定。")
+    if project_groups:
+        lines.append("按项目归档建议：")
+        for group in project_groups[:8]:
+            action = "建议创建" if group.get("kind") == "new" else "归入已有"
+            lines.append(f"- {action}：{group['project_name']}，{group['file_count']} 个文件，包含 {group['material_summary']}。")
+    if knowledge_candidates:
+        lines.append(f"知识库建议：优先收录 {len(knowledge_candidates)} 个可复用资料，例如技术条件、会议资料、审核反馈、项目基础资料。")
+    return "\n".join(lines)
+
+
+def build_inbox_batch_advice(db: Session, item_ids: list[str]) -> dict[str, Any]:
+    query = select(models.InboxItem).order_by(models.InboxItem.created_at.desc())
+    if item_ids:
+        query = query.where(models.InboxItem.id.in_(item_ids))
+    items = list(db.scalars(query))
+
+    recommended_item_ids: list[str] = []
+    knowledge_candidates: list[dict[str, str]] = []
+    duplicates: list[dict[str, str]] = []
+    needs_review: list[dict[str, str]] = []
+    grouped_items: dict[tuple[str, str, str], list[models.InboxItem]] = defaultdict(list)
+    create_project_keys: set[tuple[str, str, str]] = set()
+    batch_keys = _batch_project_group_keys(items)
+
+    for item in items:
+        item = recommend_inbox_item(db, item)
+        if item.archive_group == "重复文件" or item.recommended_action == "重复跳过":
+            duplicates.append(
+                {
+                    "id": item.id,
+                    "filename": item.original_filename,
+                    "scope": item.duplicate_scope or "unknown",
+                    "reason": item.recommend_knowledge_reason or "已存在相同文件",
+                }
+            )
+            continue
+        if item.recommended_action == "需人工确认" or item.archive_group == "需审核":
+            needs_review.append(
+                {
+                    "id": item.id,
+                    "filename": item.original_filename,
+                    "reason": item.evidence or "项目归属或资料类型不够确定",
+                }
+            )
+            continue
+
+        recommended_item_ids.append(item.id)
+        group_key = batch_keys.get(item.id, _item_project_group_key(item))
+        grouped_items[group_key].append(item)
+        if group_key[0] == "new":
+            create_project_keys.add(group_key)
+        if item.suggest_knowledge:
+            knowledge_candidates.append(
+                {
+                    "id": item.id,
+                    "filename": item.original_filename,
+                    "material_type": item.material_type,
+                    "reason": item.recommend_knowledge_reason,
+                }
+            )
+
+    project_groups: list[dict[str, Any]] = []
+    for (kind, project_key, project_name), group_items in grouped_items.items():
+        material_counts = Counter(item.material_type or "未分类" for item in group_items)
+        project_groups.append(
+            {
+                "kind": kind,
+                "project_id": project_key if kind == "existing" else "",
+                "project_name": project_name,
+                "file_count": len(group_items),
+                "knowledge_count": sum(1 for item in group_items if item.suggest_knowledge),
+                "item_ids": [item.id for item in group_items],
+                "aliases": sorted({item.suggested_project_name for item in group_items if item.suggested_project_name})[:5],
+                "material_summary": "、".join(f"{name}{count}个" for name, count in material_counts.most_common(4)),
+            }
+        )
+    project_groups.sort(key=lambda group: group["file_count"], reverse=True)
+
+    action_counts = {
+        "归档文件": len(recommended_item_ids),
+        "创建项目": len(create_project_keys),
+        "入知识库": len(knowledge_candidates),
+        "跳过重复": len(duplicates),
+        "需审核": len(needs_review),
+    }
+    markdown = _build_inbox_advice_markdown(
+        len(items),
+        action_counts,
+        project_groups,
+        knowledge_candidates,
+        duplicates,
+        needs_review,
+    )
+    return {
+        "total_files": len(items),
+        "recommended_item_ids": recommended_item_ids,
+        "action_counts": action_counts,
+        "project_groups": project_groups,
+        "knowledge_candidates": knowledge_candidates,
+        "duplicates": duplicates,
+        "needs_review": needs_review,
+        "markdown": markdown,
+        "mode": "rule",
+    }
+
+
+async def build_inbox_batch_advice_with_ai(db: Session, item_ids: list[str]) -> dict[str, Any]:
+    advice = build_inbox_batch_advice(db, item_ids)
+    if settings.mock_mode or not settings.deepseek_api_key:
+        return advice
+
+    query = select(models.InboxItem).order_by(models.InboxItem.created_at.desc())
+    if item_ids:
+        query = query.where(models.InboxItem.id.in_(item_ids))
+    items = list(db.scalars(query))
+    file_rows = [
+        {
+            "文件名": item.original_filename,
+            "建议项目": item.suggested_project_name,
+            "资料类型": item.material_type,
+            "推荐动作": item.recommended_action,
+            "是否入知识库": item.suggest_knowledge,
+            "重复状态": item.duplicate_scope,
+            "摘要": (item.summary or "")[:160],
+            "依据": (item.evidence or "")[:160],
+        }
+        for item in items
+    ]
+    prompt = f"""
+你是 ROM-AI 的项目资料管理员。请根据下面收件箱文件清单，输出一份给项目经理看的整体归档建议。
+
+要求：
+1. 不要逐个文件长篇解释，要按项目和资料角色分组。
+2. 说明哪些可以直接归档，哪些建议创建新项目，哪些建议进入知识库，哪些需要人工审核。
+3. 给出本次归档的总体判断和风险提醒。
+4. 不要改变系统已计算的动作，只解释和组织建议。
+
+系统统计：
+{json.dumps(advice["action_counts"], ensure_ascii=False)}
+
+文件清单：
+{json.dumps(file_rows, ensure_ascii=False)}
+""".strip()
+    try:
+        ai_markdown = await call_deepseek_text(
+            prompt,
+            "你负责把项目文件收件箱的识别结果整理成清晰、可执行、非技术化的归档建议。",
+        )
+    except Exception:
+        return advice
+    if ai_markdown.strip():
+        advice["markdown"] = ai_markdown.strip()
+        advice["mode"] = "deepseek"
+    return advice
+
+
+def mock_analysis_payload(project: models.Project, files: list[models.ProjectFile]) -> dict[str, Any]:
+    completeness = "低" if not files else "中"
+    tasks = [
+        {
+            "task_name": "宋式展示区归家动线策略",
+            "task_type": "策略分析",
+            "priority": "高",
+            "owner_role": "主创设计师",
+            "estimated_days": 3,
+            "dependencies": ["T001"],
+            "risk_level": "中",
+            "status": "todo",
+            "output_requirement": "输出动线分析图、策略文本、汇报PPT结构。",
+        },
+        {
+            "task_name": "社区礼序界面与门头尺度校准",
+            "task_type": "立面研究",
+            "priority": "高",
+            "owner_role": "立面负责人",
+            "estimated_days": 4,
+            "dependencies": ["宋式展示区归家动线策略"],
+            "risk_level": "中",
+            "status": "todo",
+            "output_requirement": "输出门头比例、材质建议和节点风险说明。",
+        },
+        {
+            "task_name": "展示区景观节点与室内到访体验衔接",
+            "task_type": "协同设计",
+            "priority": "中",
+            "owner_role": "景观接口",
+            "estimated_days": 2,
+            "dependencies": ["宋式展示区归家动线策略"],
+            "risk_level": "低",
+            "status": "todo",
+            "output_requirement": "输出景观节点清单、室内接口条件和体验动线说明。",
+        },
+    ]
+    timeline = [
+        {
+            "stage_name": "概念方案阶段",
+            "start_day": 1,
+            "end_day": 7,
+            "milestone": "概念方案汇报",
+            "dependencies": [],
+            "risk_note": "甲方决策周期不确定。",
+        },
+        {
+            "stage_name": "展示区深化阶段",
+            "start_day": 8,
+            "end_day": 14,
+            "milestone": "展示区动线与界面确认",
+            "dependencies": ["概念方案阶段"],
+            "risk_note": "景观、室内、立面接口需要同步确认。",
+        },
+        {
+            "stage_name": "汇报整合阶段",
+            "start_day": 15,
+            "end_day": 18,
+            "milestone": "PPT与图像成果交付",
+            "dependencies": ["展示区深化阶段"],
+            "risk_note": "素材版本与甲方关注点可能发生变化。",
+        },
+    ]
+    team_requirements = {
+        "total_headcount": 5,
+        "roles": [
+            {"role": "项目负责人", "count": 1, "skills": ["项目管理", "甲方沟通"], "intensity": "全职"},
+            {"role": "主创设计师", "count": 1, "skills": ["宋式风格", "展示区设计"], "intensity": "全职"},
+            {"role": "立面负责人", "count": 1, "skills": ["比例控制", "材料策略"], "intensity": "阶段投入"},
+            {"role": "景观接口", "count": 1, "skills": ["归家动线", "节点体验"], "intensity": "阶段投入"},
+            {"role": "汇报助理", "count": 1, "skills": ["PPT结构", "图像提示词"], "intensity": "阶段投入"},
+        ],
+    }
+    knowledge_refs = [
+        {
+            "source_file": "宋式社区方法论.md",
+            "source_path": "Obsidian Vault/方法/宋式社区方法论.md",
+            "chunk_id": "mock-song-community-001",
+            "quote": "宋式展示区应强调归家动线的礼仪感，以门庭、院落、廊下空间形成连续体验。",
+            "relevance_score": 0.92,
+        },
+        {
+            "source_file": "展示区体验动线清单.md",
+            "source_path": "Obsidian Vault/方法/展示区体验动线清单.md",
+            "chunk_id": "mock-arrival-002",
+            "quote": "首开展示区需要把车行到达、步行归家、接待转换和样板间参观整合为一条可讲述的路径。",
+            "relevance_score": 0.86,
+        },
+    ]
+    return {
+        "mode": "mock",
+        "project_basis": {
+            "project_type": project.project_type or "待确认",
+            "phase": project.phase or "待确认",
+            "资料完整度": completeness,
+            "缺失信息": ["规划条件细则", "成本目标", "甲方决策边界"] if not files else ["成本目标", "关键节点时间"],
+            "综合风险等级": "中",
+        },
+        "design_difficulties": {
+            "技术难点": ["需要尽快核对指标、总图边界、产品组合和消防/日照等基础约束。"],
+            "协调难点": ["建筑、景观、室内和报规口径需要统一，避免汇报阶段反复返工。"],
+            "规范难点": ["消防、日照、停车和无障碍需要在强排阶段提前校核。"],
+            "甲方决策难点": ["需要明确产品档次、立面成本和展示区范围。"],
+            "成本与落地难点": ["立面材料、景观节点和公区精装需要控制落地成本。"],
+            "后续深化风险点": ["资料不完整会影响任务拆解、周期判断和团队配置。"],
+        },
+        "timeline_summary": {
+            "总体推进周期": "约 28-42 天（Mock，需要人工校准）",
+            "概念方案阶段": "5-7 天",
+            "强排 / 总图阶段": "7-10 天",
+            "户型与产品阶段": "5-8 天",
+            "立面与风格阶段": "7-10 天",
+            "景观 / 室内 / 精装协同阶段": "5-8 天",
+            "报规或汇报成果阶段": "3-5 天",
+            "关键路径": ["规划条件确认", "强排稳定", "立面方向锁定", "汇报成果整合"],
+            "里程碑节点": ["概念方向会", "强排评审", "立面评审", "最终汇报"],
+            "可能延误点": ["资料缺失", "甲方反复", "多专业接口不同步"],
+        },
+        "timeline": timeline,
+        "staffing": {
+            "项目负责人 / PM": "1人",
+            "主创设计师": "1人",
+            "总图负责人": "1人",
+            "户型负责人": "1人",
+            "立面负责人": "1人",
+            "景观接口": "0.5人",
+            "室内接口": "0.5人",
+            "后期 / 报规接口": "0.5人",
+            "AI辅助人员": "1人",
+            "建议人数规模": "5-7人等效投入",
+            "每类人员技能要求": ["强排经验", "产品定位", "立面落地", "汇报组织"],
+            "各阶段人员投入强度": "前期 PM/总图高，汇报前主创/立面/汇报助理高。",
+        },
+        "team_requirements": team_requirements,
+        "knowledge_refs": knowledge_refs,
+        "tasks": tasks,
+        "next_actions": [
+            "补齐规划条件、红线、指标和甲方任务书。",
+            "建立项目资料目录并标注版本。",
+            "先做强排风险清单，再进入立面风格推演。",
+            "明确展示区、首开区和汇报成果范围。",
+            "把关键问题提交甲方形成一次决策会。",
+        ],
+    }
+
+
+def analysis_to_markdown(payload: dict[str, Any]) -> str:
+    lines = [f"# 项目分析报告（{payload.get('mode', 'mock')}）"]
+    for section, value in payload.items():
+        if section == "mode":
+            continue
+        lines.append(f"\n## {section}")
+        if isinstance(value, dict):
+            for key, item in value.items():
+                rendered = json.dumps(item, ensure_ascii=False) if not isinstance(item, str) else item
+                lines.append(f"- **{key}**：{rendered}")
+        elif isinstance(value, list):
+            for item in value:
+                rendered = json.dumps(item, ensure_ascii=False) if isinstance(item, dict) else item
+                lines.append(f"- {rendered}")
+        else:
+            lines.append(str(value))
+    return "\n".join(lines)
+
+
+def normalize_analysis_payload(payload: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    merged = {**fallback, **payload}
+    for key in ("tasks", "timeline", "knowledge_refs"):
+        if not isinstance(merged.get(key), list) or not merged[key]:
+            merged[key] = fallback.get(key, [])
+    if not isinstance(merged.get("team_requirements"), dict):
+        merged["team_requirements"] = fallback.get("team_requirements", {"total_headcount": 0, "roles": []})
+    return merged
+
+
+async def call_deepseek_json(prompt: str) -> dict[str, Any]:
+    if settings.mock_mode:
+        return {}
+    headers = {"Authorization": f"Bearer {settings.deepseek_api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": settings.deepseek_model,
+        "temperature": 0.2,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是建筑设计项目分析助手。只输出 JSON，不要输出 Markdown。字段必须稳定，缺失信息要明确标注。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(f"{settings.deepseek_base_url.rstrip('/')}/chat/completions", headers=headers, json=body)
+        response.raise_for_status()
+        text = response.json()["choices"][0]["message"]["content"]
+    match = re.search(r"\{.*\}", text, re.S)
+    if not match:
+        return {}
+    return json.loads(match.group(0))
+
+
+async def call_deepseek_text(prompt: str, system_prompt: str) -> str:
+    if settings.mock_mode:
+        return ""
+    headers = {"Authorization": f"Bearer {settings.deepseek_api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": settings.deepseek_model,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(f"{settings.deepseek_base_url.rstrip('/')}/chat/completions", headers=headers, json=body)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+
+
+def parse_deepseek_models(payload: dict[str, Any]) -> list[dict[str, str]]:
+    models = []
+    for item in payload.get("data", []):
+        model_id = str(item.get("id") or "").strip()
+        if not model_id:
+            continue
+        models.append({"id": model_id, "owned_by": str(item.get("owned_by") or "")})
+    return models
+
+
+async def list_deepseek_models() -> list[dict[str, str]]:
+    if settings.mock_mode:
+        return []
+    headers = {"Authorization": f"Bearer {settings.deepseek_api_key}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(f"{settings.deepseek_base_url.rstrip('/')}/models", headers=headers)
+        response.raise_for_status()
+        return parse_deepseek_models(response.json())
+
+
+def save_analysis_result(db: Session, project: models.Project, payload: dict[str, Any], mode: str) -> models.ProjectReport:
+    report = models.ProjectReport(
+        project_id=project.id,
+        report_type="project_analysis",
+        content_json=json.dumps(payload, ensure_ascii=False),
+        markdown=analysis_to_markdown(payload),
+        model_name=settings.deepseek_model if mode == "deepseek" else "mock",
+        mode=mode,
+    )
+    db.add(report)
+    db.execute(delete(models.ProjectTask).where(models.ProjectTask.project_id == project.id))
+    db.execute(delete(models.ProjectTimeline).where(models.ProjectTimeline.project_id == project.id))
+    db.execute(delete(models.KnowledgeReference).where(models.KnowledgeReference.project_id == project.id))
+    for item in payload.get("tasks", []):
+        db.add(
+            models.ProjectTask(
+                project_id=project.id,
+                task_name=item.get("task_name", ""),
+                task_type=item.get("task_type", ""),
+                priority=item.get("priority", "medium"),
+                owner_role=item.get("owner_role", ""),
+                estimated_days=int(item.get("estimated_days") or 1),
+                dependencies=json.dumps(item.get("dependencies") or [], ensure_ascii=False),
+                risk_level=item.get("risk_level", "medium"),
+                status=item.get("status", "todo"),
+                output_requirement=item.get("output_requirement", ""),
+            )
+        )
+    for item in payload.get("timeline", []):
+        db.add(
+            models.ProjectTimeline(
+                project_id=project.id,
+                stage_name=item.get("stage_name", ""),
+                start_day=int(item.get("start_day") or 1),
+                end_day=int(item.get("end_day") or item.get("start_day") or 1),
+                milestone=item.get("milestone", ""),
+                dependencies=json.dumps(item.get("dependencies") or [], ensure_ascii=False),
+                risk_note=item.get("risk_note", ""),
+            )
+        )
+    for item in payload.get("knowledge_refs", []):
+        db.add(
+            models.KnowledgeReference(
+                project_id=project.id,
+                source_file=item.get("source_file", ""),
+                source_path=item.get("source_path", ""),
+                chunk_id=item.get("chunk_id", ""),
+                quote=item.get("quote", ""),
+                relevance_score=float(item.get("relevance_score") or 0),
+            )
+        )
+    db.commit()
+    db.refresh(report)
+    return report
+
+
+def ensure_project_sidecars(db: Session, project: models.Project) -> None:
+    if project.tasks and project.timelines:
+        return
+    payload = mock_analysis_payload(project, project.files)
+    save_analysis_result(db, project, payload, "mock")
+    db.refresh(project)
+
+
+def team_requirements_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    value = payload.get("team_requirements")
+    if isinstance(value, dict):
+        return value
+    return {"total_headcount": 0, "roles": []}
+
+
+def extract_md_metadata(text: str) -> tuple[str, list[str], list[str]]:
+    heading = ""
+    for line in text.splitlines():
+        if line.startswith("#"):
+            heading = line.lstrip("#").strip()
+            break
+    tags = sorted(set(re.findall(r"(?<!\w)#([\w\u4e00-\u9fff/-]+)", text)))
+    links = sorted(set(re.findall(r"\[\[([^\]]+)\]\]", text)))
+    return heading, tags, links
+
+
+def chunk_text(text: str, path: str, tags: list[str], links: list[str]) -> list[dict[str, Any]]:
+    if not text.strip():
+        return []
+    chunks = []
+    current_heading = ""
+    buffer = []
+    for line in text.splitlines():
+        if line.startswith("#") and buffer:
+            content = "\n".join(buffer).strip()
+            if content:
+                chunks.append({"heading": current_heading, "content": content, "path": path, "tags": tags, "links": links})
+            current_heading = line.lstrip("#").strip()
+            buffer = [line]
+        else:
+            if line.startswith("#") and not current_heading:
+                current_heading = line.lstrip("#").strip()
+            buffer.append(line)
+    content = "\n".join(buffer).strip()
+    if content:
+        chunks.append({"heading": current_heading, "content": content, "path": path, "tags": tags, "links": links})
+    final = []
+    for chunk in chunks:
+        content = chunk["content"]
+        if len(content) <= 1600:
+            final.append(chunk)
+            continue
+        for i in range(0, len(content), 1400):
+            final.append({**chunk, "content": content[i : i + 1600]})
+    return final
+
+
+def safe_browser_relative_path(filename: str) -> str:
+    normalized = filename.replace("\\", "/").lstrip("/")
+    parts = [part for part in PurePosixPath(normalized).parts if part not in {"", ".", ".."} and ":" not in part]
+    return "/".join(parts) or "uploaded-file"
+
+
+def index_knowledge_file(db: Session, source_path: Path, display_path: Optional[str] = None) -> dict[str, Any]:
+    ext = source_path.suffix.lower()
+    text, status = parse_document(source_path)
+    heading, tags, links = extract_md_metadata(text) if ext == ".md" else ("", [], [])
+    indexed_path = display_path or str(source_path)
+    record = db.scalar(select(models.KnowledgeFile).where(models.KnowledgeFile.filepath == indexed_path))
+    if not record:
+        record = models.KnowledgeFile(filepath=indexed_path)
+        db.add(record)
+        db.flush()
+    record.filename = Path(indexed_path).name
+    record.filetype = ext.lstrip(".")
+    record.filesize = source_path.stat().st_size
+    record.title = heading or source_path.stem
+    record.folder = str(Path(indexed_path).parent)
+    db.execute(delete(models.KnowledgeChunk).where(models.KnowledgeChunk.file_id == record.id))
+    db.execute(delete(models.KnowledgeTag).where(models.KnowledgeTag.file_id == record.id))
+    db.execute(delete(models.KnowledgeLink).where(models.KnowledgeLink.file_id == record.id))
+    for chunk in chunk_text(text, indexed_path, tags, links):
+        db.add(
+            models.KnowledgeChunk(
+                file_id=record.id,
+                heading=chunk["heading"],
+                content=chunk["content"],
+                path=chunk["path"],
+                tags=json.dumps(chunk["tags"], ensure_ascii=False),
+                links=json.dumps(chunk["links"], ensure_ascii=False),
+            )
+        )
+    for tag, count in Counter(tags).items():
+        db.add(models.KnowledgeTag(file_id=record.id, tag=tag, count=count))
+    for link in links:
+        db.add(models.KnowledgeLink(file_id=record.id, source_path=indexed_path, target=link))
+    return {"filename": record.filename, "path": indexed_path, "filetype": record.filetype, "status": status}
+
+
+def upsert_knowledge_markdown(db: Session, indexed_path: str, title: str, markdown: str, tags: list[str]) -> models.KnowledgeFile:
+    record = db.scalar(select(models.KnowledgeFile).where(models.KnowledgeFile.filepath == indexed_path))
+    if not record:
+        record = models.KnowledgeFile(filepath=indexed_path)
+        db.add(record)
+        db.flush()
+    record.filename = Path(indexed_path).name
+    record.filetype = "md"
+    record.filesize = len(markdown.encode("utf-8"))
+    record.title = title
+    record.folder = str(Path(indexed_path).parent)
+    db.execute(delete(models.KnowledgeChunk).where(models.KnowledgeChunk.file_id == record.id))
+    db.execute(delete(models.KnowledgeTag).where(models.KnowledgeTag.file_id == record.id))
+    db.execute(delete(models.KnowledgeLink).where(models.KnowledgeLink.file_id == record.id))
+    for chunk in chunk_text(markdown, indexed_path, tags, []):
+        db.add(
+            models.KnowledgeChunk(
+                file_id=record.id,
+                heading=chunk["heading"],
+                content=chunk["content"],
+                path=chunk["path"],
+                tags=json.dumps(chunk["tags"], ensure_ascii=False),
+                links=json.dumps(chunk["links"], ensure_ascii=False),
+            )
+        )
+    for tag, count in Counter(tags).items():
+        db.add(models.KnowledgeTag(file_id=record.id, tag=tag, count=count))
+    return record
+
+
+def scan_knowledge_directory(db: Session, directory: Path, clear_existing: bool = False) -> dict[str, Any]:
+    if clear_existing:
+        db.execute(delete(models.KnowledgeLink))
+        db.execute(delete(models.KnowledgeTag))
+        db.execute(delete(models.KnowledgeChunk))
+        db.execute(delete(models.KnowledgeFile))
+        db.commit()
+    stats = Counter()
+    recent = []
+    for path in directory.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_KNOWLEDGE_EXTS:
+            continue
+        ext = path.suffix.lower()
+        stats["total_files"] += 1
+        stats[ext.lstrip(".") or "other"] += 1
+        recent.append(index_knowledge_file(db, path))
+    db.commit()
+    return {"indexed_files": stats["total_files"], "stats": knowledge_stats(db), "skipped_files": [], "recent_files": recent[:20]}
+
+
+def should_index_vault_path(path: Path, root: Path, include_sync_notes: bool = False) -> tuple[bool, str]:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = path
+    parts = set(relative.parts)
+    if parts & DEFAULT_VAULT_EXCLUDE_DIRS:
+        return False, "excluded_directory"
+    if not include_sync_notes and "笔记同步助手" in parts:
+        return False, "sync_notes_optional"
+    if path.suffix.lower() not in SUPPORTED_KNOWLEDGE_EXTS:
+        return False, "unsupported_type"
+    if path.suffix.lower() in DEFAULT_VAULT_EXCLUDE_EXTS:
+        return False, "excluded_type"
+    try:
+        if path.stat().st_size == 0:
+            return False, "empty_file"
+        if path.stat().st_size > DEFAULT_VAULT_MAX_FILE_SIZE:
+            return False, "large_file"
+    except OSError:
+        return False, "stat_failed"
+    return True, "ok"
+
+
+def scan_vault_directory(
+    db: Session,
+    directory: Path,
+    clear_existing: bool = False,
+    include_sync_notes: bool = False,
+) -> dict[str, Any]:
+    if clear_existing:
+        db.execute(delete(models.KnowledgeLink))
+        db.execute(delete(models.KnowledgeTag))
+        db.execute(delete(models.KnowledgeChunk))
+        db.execute(delete(models.KnowledgeFile))
+        db.commit()
+    stats = Counter()
+    skipped = Counter()
+    recent = []
+    priority_prefixes = ("wiki", "raw", "Obj-")
+    for path in directory.rglob("*"):
+        if not path.is_file():
+            continue
+        allowed, reason = should_index_vault_path(path, directory, include_sync_notes=include_sync_notes)
+        if not allowed:
+            skipped[reason] += 1
+            continue
+        try:
+            rel = path.relative_to(directory)
+            first = rel.parts[0] if rel.parts else ""
+            priority = first == "wiki" or first == "raw" or first.startswith("Obj-")
+        except ValueError:
+            priority = False
+        indexed = index_knowledge_file(db, path)
+        indexed["priority_source"] = priority
+        recent.append(indexed)
+        stats["total_files"] += 1
+        stats[path.suffix.lower().lstrip(".") or "other"] += 1
+        if any(str(path).find(prefix) >= 0 for prefix in priority_prefixes):
+            stats["priority_files"] += 1
+    db.commit()
+    return {
+        "indexed_files": stats["total_files"],
+        "stats": knowledge_stats(db),
+        "skipped": dict(skipped),
+        "skipped_files": [{"reason": reason, "count": count} for reason, count in skipped.items()],
+        "recent_files": recent[:30],
+        "filters": {
+            "excluded_dirs": sorted(DEFAULT_VAULT_EXCLUDE_DIRS),
+            "max_file_mb": DEFAULT_VAULT_MAX_FILE_SIZE // 1024 // 1024,
+            "include_sync_notes": include_sync_notes,
+        },
+    }
+
+
+def scan_vault_directory_with_progress(
+    db: Session,
+    directory: Path,
+    clear_existing: bool = False,
+    include_sync_notes: bool = False,
+    progress: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    if clear_existing:
+        db.execute(delete(models.KnowledgeLink))
+        db.execute(delete(models.KnowledgeTag))
+        db.execute(delete(models.KnowledgeChunk))
+        db.execute(delete(models.KnowledgeFile))
+        db.commit()
+    stats = Counter()
+    skipped = Counter()
+    recent = []
+    paths = [path for path in directory.rglob("*") if path.is_file()]
+    total = len(paths)
+    if progress is not None:
+        progress.update({"total_candidates": total, "processed": 0, "indexed_files": 0, "skipped_files": 0})
+    priority_prefixes = ("wiki", "raw", "Obj-")
+    for index, path in enumerate(paths, start=1):
+        if progress is not None:
+            progress.update({"processed": index, "current_file": str(path)})
+        allowed, reason = should_index_vault_path(path, directory, include_sync_notes=include_sync_notes)
+        if not allowed:
+            skipped[reason] += 1
+            if progress is not None:
+                progress["skipped_files"] = sum(skipped.values())
+            continue
+        try:
+            rel = path.relative_to(directory)
+            first = rel.parts[0] if rel.parts else ""
+            priority = first == "wiki" or first == "raw" or first.startswith("Obj-")
+        except ValueError:
+            priority = False
+        indexed = index_knowledge_file(db, path)
+        indexed["priority_source"] = priority
+        recent.append(indexed)
+        stats["total_files"] += 1
+        stats[path.suffix.lower().lstrip(".") or "other"] += 1
+        if any(str(path).find(prefix) >= 0 for prefix in priority_prefixes):
+            stats["priority_files"] += 1
+        if progress is not None:
+            progress["indexed_files"] = stats["total_files"]
+        if stats["total_files"] % 25 == 0:
+            db.commit()
+    db.commit()
+    result = {
+        "indexed_files": stats["total_files"],
+        "stats": knowledge_stats(db),
+        "skipped": dict(skipped),
+        "skipped_files": [{"reason": reason, "count": count} for reason, count in skipped.items()],
+        "recent_files": recent[:30],
+        "filters": {
+            "excluded_dirs": sorted(DEFAULT_VAULT_EXCLUDE_DIRS),
+            "max_file_mb": DEFAULT_VAULT_MAX_FILE_SIZE // 1024 // 1024,
+            "include_sync_notes": include_sync_notes,
+        },
+    }
+    if progress is not None:
+        progress.update({"processed": total, "current_file": "", "result": result})
+    return result
+
+
+def knowledge_overview(db: Session) -> dict[str, Any]:
+    stats = knowledge_stats(db)
+    files = list(db.scalars(select(models.KnowledgeFile).order_by(models.KnowledgeFile.updated_at.desc()).limit(80)))
+    folder_counts = Counter(file.folder or "未分组" for file in files)
+    type_counts = stats.get("filetype_distribution", {})
+    recent = [
+        {
+            "filename": file.filename,
+            "filepath": file.filepath,
+            "filetype": file.filetype,
+        }
+        for file in files[:12]
+    ]
+    return {
+        "stats": stats,
+        "top_folders": [{"folder": folder, "count": count} for folder, count in folder_counts.most_common(10)],
+        "type_counts": type_counts,
+        "recent_files": recent,
+    }
+
+
+def is_knowledge_overview_question(question: str) -> bool:
+    normalized = question.strip().replace("？", "").replace("?", "")
+    return any(trigger in normalized for trigger in KNOWLEDGE_OVERVIEW_TRIGGERS)
+
+
+def knowledge_overview_answer(db: Session) -> tuple[str, list[dict[str, Any]]]:
+    overview = knowledge_overview(db)
+    stats = overview["stats"]
+    if not stats.get("total_files"):
+        return "知识库目前还没有索引内容。请先索引本地路径或上传文件夹。", []
+    type_counts = stats.get("filetype_distribution", {})
+    type_text = "、".join(f"{key}: {value}" for key, value in sorted(type_counts.items())) or "暂无类型统计"
+    folder_lines = "\n".join(f"- {item['folder']}：{item['count']} 个近期文件" for item in overview["top_folders"][:8])
+    recent_lines = "\n".join(f"- {item['filename']}（{item['filetype']}）\n  {item['filepath']}" for item in overview["recent_files"][:8])
+    answer = (
+        "你的知识库当前已建立索引，可以从整体结构上这样理解：\n\n"
+        f"- 总文件：{stats['total_files']} 个\n"
+        f"- Markdown：{stats['markdown_files']} 个\n"
+        f"- PDF / Word / Excel：{stats['pdf_docx_xlsx_files']} 个\n"
+        f"- 图片：{stats['image_files']} 个\n"
+        f"- 双链：{stats['link_count']} 条\n"
+        f"- 文件类型分布：{type_text}\n\n"
+        "近期资料主要分布在：\n"
+        f"{folder_lines or '- 暂无分组'}\n\n"
+        "最近索引的代表文件：\n"
+        f"{recent_lines or '- 暂无文件'}\n\n"
+        "你可以继续问更具体的问题，例如某个项目、某类规范、某个阶段任务或某份文件。"
+    )
+    refs = [
+        {
+            "chunk_id": "",
+            "file_name": item["filename"],
+            "file_path": item["filepath"],
+            "quote": "知识库概览代表文件",
+            "heading": "",
+        }
+        for item in overview["recent_files"][:8]
+    ]
+    return answer, refs
+
+
+def knowledge_stats(db: Session) -> dict[str, Any]:
+    files = list(db.scalars(select(models.KnowledgeFile)))
+    tags = list(db.scalars(select(models.KnowledgeTag)))
+    links_count = db.scalar(select(func.count(models.KnowledgeLink.id))) or 0
+    type_counts = Counter(file.filetype for file in files)
+    top_tags = Counter()
+    for tag in tags:
+        top_tags[tag.tag] += tag.count
+    return {
+        "total_files": len(files),
+        "markdown_files": type_counts.get("md", 0),
+        "pdf_docx_xlsx_files": type_counts.get("pdf", 0) + type_counts.get("docx", 0) + type_counts.get("xlsx", 0),
+        "image_files": type_counts.get("png", 0) + type_counts.get("jpg", 0) + type_counts.get("jpeg", 0),
+        "filetype_distribution": dict(type_counts),
+        "top_tags": [{"tag": tag, "count": count} for tag, count in top_tags.most_common(20)],
+        "link_count": links_count,
+    }
+
+
+def knowledge_tree(db: Session) -> list[dict[str, Any]]:
+    files = list(db.scalars(select(models.KnowledgeFile).order_by(models.KnowledgeFile.filepath)))
+    roots: dict[str, Any] = {}
+    for file in files:
+        parts = Path(file.filepath).parts
+        current = roots
+        for part in parts[:-1]:
+            current = current.setdefault(part, {})
+        current.setdefault("_files", []).append({"name": file.filename, "path": file.filepath, "filetype": file.filetype})
+
+    def pack(name: str, value: Any) -> dict[str, Any]:
+        children = [pack(k, v) for k, v in value.items() if k != "_files"]
+        files_nodes = [{"name": f["name"], "type": "file", "path": f["path"], "filetype": f["filetype"]} for f in value.get("_files", [])]
+        return {"name": name, "type": "folder", "children": children + files_nodes}
+
+    return [pack(k, v) for k, v in roots.items()]
+
+
+def list_knowledge_files(db: Session, q: str = "", limit: int = 100) -> dict[str, Any]:
+    safe_limit = max(1, min(limit or 100, 500))
+    query = select(models.KnowledgeFile).order_by(models.KnowledgeFile.updated_at.desc())
+    if q.strip():
+        keyword = f"%{q.strip()}%"
+        query = query.where(or_(models.KnowledgeFile.filename.like(keyword), models.KnowledgeFile.filepath.like(keyword)))
+    all_items = list(db.scalars(query))
+    items = all_items[:safe_limit]
+    return {
+        "total": len(all_items),
+        "items": [
+            {
+                "id": item.id,
+                "filename": item.filename,
+                "filepath": item.filepath,
+                "filetype": item.filetype,
+                "filesize": item.filesize,
+                "updated_at": item.updated_at,
+            }
+            for item in items
+        ],
+    }
+
+
+def search_knowledge(db: Session, question: str, limit: int = 6) -> list[models.KnowledgeChunk]:
+    terms = [term for term in re.split(r"\s+", question.strip()) if term]
+    query = select(models.KnowledgeChunk)
+    if terms:
+        clauses = []
+        for term in terms[:6]:
+            clauses.append(models.KnowledgeChunk.content.ilike(f"%{term}%"))
+            clauses.append(models.KnowledgeChunk.heading.ilike(f"%{term}%"))
+        query = query.where(or_(*clauses))
+    chunks = list(db.scalars(query.limit(limit)))
+    if chunks or not terms:
+        return chunks
+    return list(db.scalars(select(models.KnowledgeChunk).order_by(models.KnowledgeChunk.updated_at.desc()).limit(limit)))
+
+
+def _markdown_list(items: list[str]) -> str:
+    return "\n".join(f"- {item}" for item in items)
+
+
+def _refs_from_chunks(chunks: list[models.KnowledgeChunk]) -> list[dict[str, Any]]:
+    refs = []
+    for chunk in chunks:
+        refs.append(
+            {
+                "chunk_id": chunk.id,
+                "source_file": Path(chunk.path).name,
+                "source_path": chunk.path,
+                "heading": chunk.heading,
+                "quote": chunk.content[:420],
+                "relevance_score": 0.82,
+            }
+        )
+    return refs
+
+
+def build_startup_analysis_payload(project: models.Project, chunks: list[models.KnowledgeChunk]) -> dict[str, Any]:
+    refs = _refs_from_chunks(chunks)
+    ref_names = [ref["source_file"] for ref in refs[:6]]
+    description = project.description or "暂无项目描述，需由项目经理补充业主诉求、规模、阶段和交付目标。"
+    technical_focus_cards = [
+        {
+            "title": "技术卡_日照计算",
+            "dimension": "日照",
+            "summary": "启动阶段应确认当地日照规则、分析口径、遮挡边界和是否已有日照复核成果。",
+            "checkpoints": ["大寒日/冬至日口径", "被遮挡对象", "楼栋间距", "复核图纸版本"],
+            "source_refs": ref_names,
+            "manual_confirm": "需要人工确认当地规划部门采用的日照计算口径。",
+        },
+        {
+            "title": "技术卡_退界要求",
+            "dimension": "退界",
+            "summary": "优先核对红线、道路、邻地、消防登高面及地下边界退距。",
+            "checkpoints": ["用地红线", "道路退距", "邻地退距", "地下室边界", "消防登高面"],
+            "source_refs": ref_names,
+            "manual_confirm": "需要以规划条件或设计任务书为准。",
+        },
+        {
+            "title": "技术卡_面积计算",
+            "dimension": "面积",
+            "summary": "明确计容/不计容、赠送面积、架空层、人防、地下室和配套用房计算方式。",
+            "checkpoints": ["计容总建面", "可售面积", "地下室", "架空层", "配套用房", "人防面积"],
+            "source_refs": ref_names,
+            "manual_confirm": "需要和当地面积测绘/报规口径交叉确认。",
+        },
+        {
+            "title": "技术卡_消防风险",
+            "dimension": "消防",
+            "summary": "强排前置检查消防车道、登高场地、间距、防火分区和地下车库组织。",
+            "checkpoints": ["消防车道", "登高场地", "防火间距", "地下车库", "疏散组织"],
+            "source_refs": ref_names,
+            "manual_confirm": "需要专业负责人复核。",
+        },
+        {
+            "title": "技术卡_规划条件",
+            "dimension": "规划",
+            "summary": "项目启动必须锁定容积率、限高、密度、绿地率、停车、配套和地块边界。",
+            "checkpoints": ["容积率", "限高", "建筑密度", "绿地率", "停车配比", "配套要求"],
+            "source_refs": ref_names,
+            "manual_confirm": "缺规划条件时，不应进入最终任务拆解。",
+        },
+        {
+            "title": "技术卡_报批风险",
+            "dimension": "报批",
+            "summary": "识别需要提前沟通的规划、消防、人防、面积、日照和专家会风险。",
+            "checkpoints": ["规划沟通", "消防审查", "人防口径", "面积测算", "日照复核", "专家会"],
+            "source_refs": ref_names,
+            "manual_confirm": "需要项目经理形成待业主确认清单。",
+        },
+    ]
+    task_breakdown = [
+        {
+            "task_name": "项目启动资料完整性检查",
+            "task_type": "启动检查",
+            "priority": "高",
+            "owner_role": "项目经理",
+            "estimated_days": 1,
+            "dependencies": [],
+            "risk_level": "中",
+            "status": "todo",
+            "output_requirement": "形成资料缺口表，确认规划条件、红线、任务书和历史参考资料。",
+        },
+        {
+            "task_name": "历史项目技术复用提取",
+            "task_type": "知识复用",
+            "priority": "高",
+            "owner_role": "AI资料管理员",
+            "estimated_days": 1,
+            "dependencies": ["项目启动资料完整性检查"],
+            "risk_level": "中",
+            "status": "todo",
+            "output_requirement": "输出日照、退界、面积、消防、规划、报批六类技术卡。",
+        },
+        {
+            "task_name": "启动会议程与业主确认清单",
+            "task_type": "会议推进",
+            "priority": "高",
+            "owner_role": "项目经理",
+            "estimated_days": 1,
+            "dependencies": ["历史项目技术复用提取"],
+            "risk_level": "低",
+            "status": "todo",
+            "output_requirement": "形成启动会议程、待确认问题和下一步责任人。",
+        },
+        {
+            "task_name": "项目启动汇报PPT结构",
+            "task_type": "汇报组织",
+            "priority": "中",
+            "owner_role": "AI汇报助理",
+            "estimated_days": 2,
+            "dependencies": ["启动会议程与业主确认清单"],
+            "risk_level": "中",
+            "status": "todo",
+            "output_requirement": "输出面向业主的PPT目录和每页核心表达。",
+        },
+    ]
+    meeting_agenda = [
+        "确认项目背景、区位、规模、设计阶段和业主诉求。",
+        "核对规划条件、红线、日照、退界、面积计算和消防/报批资料缺口。",
+        "复用历史项目经验，明确哪些规则可参考、哪些必须重新确认。",
+        "确认本轮交付物、责任人和时间节点。",
+        "形成下次会议前的待办和业主决策事项。",
+    ]
+    ppt_outline = [
+        {"page": 1, "title": "项目启动背景", "content": "项目基本信息、业主诉求、当前阶段。"},
+        {"page": 2, "title": "资料完整度与缺口", "content": "已上传资料、缺失资料、需确认来源。"},
+        {"page": 3, "title": "历史项目技术复用", "content": "日照、退界、面积、消防、规划、报批六类重点。"},
+        {"page": 4, "title": "启动阶段任务拆解", "content": "任务、负责人、优先级、交付物。"},
+        {"page": 5, "title": "风险与下一步", "content": "未决问题、业主决策事项、下一次会议。"},
+    ]
+    risk_list = [
+        "规划条件、红线或任务书缺失会导致任务拆解偏差。",
+        "日照、退界、面积计算口径必须以当地正式要求为准。",
+        "历史项目只能作为复用参考，不能替代本项目审批依据。",
+        "若会议结论不回写任务看板，项目经理后续追踪会断链。",
+    ]
+    open_questions = [
+        "业主本轮最关心的是进度、产品定位、成本还是报批风险？",
+        "是否已有正式规划条件、红线和设计任务书？",
+        "本项目是否需要先做强排可行性或日照快速复核？",
+        "启动会后哪些事项需要业主书面确认？",
+    ]
+    mindmap_json = {
+        "title": "项目启动分析",
+        "nodes": [
+            {
+                "id": "project",
+                "label": project.name,
+                "children": [
+                    {
+                        "id": "technical",
+                        "label": "技术重点",
+                        "children": [{"id": card["dimension"], "label": card["dimension"]} for card in technical_focus_cards],
+                    },
+                    {
+                        "id": "tasks",
+                        "label": "任务拆解",
+                        "children": [{"id": item["task_name"], "label": item["task_name"]} for item in task_breakdown],
+                    },
+                    {
+                        "id": "meeting",
+                        "label": "启动会",
+                        "children": [{"id": str(idx), "label": item} for idx, item in enumerate(meeting_agenda, start=1)],
+                    },
+                    {
+                        "id": "ppt",
+                        "label": "PPT结构",
+                        "children": [{"id": str(item["page"]), "label": item["title"]} for item in ppt_outline],
+                    },
+                ],
+            }
+        ],
+    }
+    return {
+        "mode": "mock" if settings.mock_mode else "local_workflow",
+        "project_summary": {
+            "name": project.name,
+            "city": project.city,
+            "project_type": project.project_type,
+            "phase": project.phase,
+            "description": description,
+            "knowledge_refs_count": len(refs),
+            "summary": f"{project.name} 当前进入项目启动分析，重点是把资料缺口、历史技术复用和会议推进转成可执行任务。",
+        },
+        "technical_focus_cards": technical_focus_cards,
+        "task_breakdown": task_breakdown,
+        "meeting_agenda": meeting_agenda,
+        "ppt_outline": ppt_outline,
+        "risk_list": risk_list,
+        "open_questions": open_questions,
+        "mindmap_json": mindmap_json,
+        "source_refs": refs,
+    }
+
+
+def pending_analysis_files(project: models.Project) -> list[models.ProjectFile]:
+    return [file for file in project.files if (file.analysis_status or "pending") == "pending"]
+
+
+def _project_file_context(project: models.Project, limit: int = 8, files: Optional[list[models.ProjectFile]] = None) -> list[dict[str, str]]:
+    contexts = []
+    source_files = files if files is not None else project.files
+    for file in source_files[:limit]:
+        text = (file.parsed_text or "").strip()
+        status = file.parse_status or "pending"
+        if not text:
+            text = "文件尚未解析出文本，请在分析中标记为资料未解析或仅可作为文件存在性参考。"
+        contexts.append(
+            {
+                "file_id": file.id,
+                "filename": file.filename,
+                "filetype": file.filetype,
+                "parse_status": status,
+                "analysis_status": file.analysis_status or "pending",
+                "text": text[:5000],
+            }
+        )
+    return contexts
+
+
+def build_startup_analysis_prompt(project: models.Project, chunks: list[models.KnowledgeChunk], files: Optional[list[models.ProjectFile]] = None) -> str:
+    file_context = _project_file_context(project, files=files)
+    source_refs = _refs_from_chunks(chunks)
+    expected_schema = {
+        "project_summary": {
+            "name": "项目名称",
+            "city": "城市",
+            "project_type": "项目类型",
+            "phase": "阶段",
+            "description": "项目描述",
+            "knowledge_refs_count": 0,
+            "summary": "基于上传文件和知识库资料形成的真实启动分析摘要",
+        },
+        "technical_focus_cards": [
+            {
+                "title": "技术卡标题",
+                "dimension": "日照/退界/面积/消防/规划/报批等维度",
+                "summary": "结合上传文件的判断",
+                "checkpoints": ["需要复核的具体事项"],
+                "source_refs": ["引用的文件名或知识库来源"],
+                "manual_confirm": "需要人工确认的内容或风险等级",
+            }
+        ],
+        "task_breakdown": [
+            {
+                "task_name": "任务名称",
+                "task_type": "任务类型",
+                "priority": "高/中/低",
+                "owner_role": "负责人角色",
+                "estimated_days": 1,
+                "dependencies": [],
+                "risk_level": "高/中/低",
+                "status": "todo",
+                "output_requirement": "交付物要求",
+            }
+        ],
+        "meeting_agenda": ["启动会要讨论的问题"],
+        "ppt_outline": [{"page": 1, "title": "页面标题", "content": "页面核心内容"}],
+        "risk_list": ["风险点"],
+        "open_questions": ["待确认问题"],
+        "mindmap_json": {"title": "项目启动分析", "nodes": []},
+        "source_refs": [
+            {
+                "chunk_id": "来源ID",
+                "source_file": "来源文件",
+                "source_path": "来源路径",
+                "heading": "标题",
+                "quote": "引用片段",
+                "relevance_score": 0.8,
+            }
+        ],
+    }
+    return (
+        "请基于项目基本信息、用户上传并解析的文件内容、以及知识库检索片段，生成建筑设计项目启动分析 JSON。\n"
+        "必须优先分析上传文件里的真实内容；如果资料不足，请明确指出缺口，不要编造不存在的条件。\n"
+        "只输出 JSON，不要输出 Markdown，不要解释。\n\n"
+        "项目基本信息：\n"
+        f"{json.dumps({'name': project.name, 'city': project.city, 'project_type': project.project_type, 'phase': project.phase, 'description': project.description}, ensure_ascii=False, indent=2)}\n\n"
+        "本次待分析文件内容：\n"
+        f"{json.dumps(file_context, ensure_ascii=False, indent=2)}\n\n"
+        "知识库检索片段：\n"
+        f"{json.dumps(source_refs, ensure_ascii=False, indent=2)}\n\n"
+        "输出 JSON Schema 示例：\n"
+        f"{json.dumps(expected_schema, ensure_ascii=False, indent=2)}"
+    )
+
+
+def normalize_startup_analysis_payload(payload: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(payload or {})
+    for key in [
+        "project_summary",
+        "technical_focus_cards",
+        "task_breakdown",
+        "meeting_agenda",
+        "ppt_outline",
+        "risk_list",
+        "open_questions",
+        "mindmap_json",
+        "source_refs",
+    ]:
+        if not merged.get(key):
+            merged[key] = fallback.get(key)
+    if not isinstance(merged.get("project_summary"), dict):
+        merged["project_summary"] = fallback.get("project_summary", {})
+    if not isinstance(merged.get("mindmap_json"), dict):
+        merged["mindmap_json"] = fallback.get("mindmap_json", {"title": "项目启动分析", "nodes": []})
+    for key in ["technical_focus_cards", "task_breakdown", "meeting_agenda", "ppt_outline", "risk_list", "open_questions", "source_refs"]:
+        if not isinstance(merged.get(key), list):
+            merged[key] = fallback.get(key, [])
+    merged["mode"] = merged.get("mode") or "deepseek"
+    return merged
+
+
+def startup_analysis_to_markdown(payload: dict[str, Any]) -> str:
+    summary = payload.get("project_summary", {})
+    lines = [
+        "# 项目启动分析",
+        "",
+        f"## 项目摘要",
+        f"- 项目：{summary.get('name', '')}",
+        f"- 阶段：{summary.get('phase', '')}",
+        f"- 结论：{summary.get('summary', '')}",
+        "",
+        "## 技术重点",
+    ]
+    for card in payload.get("technical_focus_cards", []):
+        lines.append(f"- **{card.get('dimension')}**：{card.get('summary')}")
+    lines.extend(["", "## 任务拆解"])
+    for task in payload.get("task_breakdown", []):
+        lines.append(f"- {task.get('task_name')}（{task.get('owner_role')} / {task.get('priority')}）")
+    lines.extend(["", "## 启动会议程"])
+    lines.extend(f"{idx}. {item}" for idx, item in enumerate(payload.get("meeting_agenda", []), start=1))
+    lines.extend(["", "## PPT结构"])
+    for item in payload.get("ppt_outline", []):
+        lines.append(f"{item.get('page')}. {item.get('title')}：{item.get('content')}")
+    lines.extend(["", "## 风险与未决问题"])
+    lines.extend(f"- {item}" for item in payload.get("risk_list", []))
+    lines.extend(f"- 待确认：{item}" for item in payload.get("open_questions", []))
+    return "\n".join(lines)
+
+
+def _upsert_startup_skill_card(
+    db: Session,
+    project: models.Project,
+    card_type: str,
+    title: str,
+    markdown: str,
+    output: dict[str, Any],
+) -> models.SkillCard:
+    card = db.scalar(
+        select(models.SkillCard).where(models.SkillCard.project_id == project.id, models.SkillCard.card_type == card_type)
+    )
+    if not card:
+        card = models.SkillCard(project_id=project.id, card_type=card_type)
+        db.add(card)
+    card.title = title
+    card.status = "succeeded"
+    card.input_data = json.dumps({"source": "startup_analysis"}, ensure_ascii=False)
+    card.output_data = json.dumps(output, ensure_ascii=False)
+    card.input_json = json.dumps({"source": "startup_analysis"}, ensure_ascii=False)
+    card.output_json = json.dumps(output, ensure_ascii=False)
+    card.markdown = markdown
+    card.source = "startup_analysis"
+    card.created_by = "system"
+    card.completed_at = datetime.utcnow()
+    return card
+
+
+def _candidate_markdown(title: str, body: str, sources: list[str]) -> str:
+    lines = [
+        "---",
+        "type: obsidian_candidate",
+        f'title: "{title}"',
+        "status: pending_review",
+        f'updated: "{datetime.utcnow().date().isoformat()}"',
+        "---",
+        "",
+        f"# {title}",
+        "",
+        body,
+        "",
+        "## 候选来源",
+    ]
+    lines.extend(f"- {source}" for source in sources[:8])
+    return "\n".join(lines)
+
+
+def startup_analysis_deposit_markdown(project: models.Project, payload: dict[str, Any], report_id: str) -> str:
+    summary = payload.get("project_summary", {})
+    lines = [
+        "---",
+        "type: project_deposit",
+        f'project_id: "{project.id}"',
+        f'project_name: "{project.name}"',
+        f'city: "{project.city}"',
+        f'phase: "{project.phase}"',
+        f'report_id: "{report_id}"',
+        f'updated: "{datetime.utcnow().date().isoformat()}"',
+        "---",
+        "",
+        f"# {project.name} 项目分析沉淀",
+        "",
+        "## 项目摘要",
+        summary.get("summary") or project.description or "暂无摘要。",
+        "",
+        "## 可复用技术重点",
+    ]
+    for card in payload.get("technical_focus_cards", []):
+        lines.append(f"### {card.get('title') or card.get('dimension') or '技术重点'}")
+        lines.append(card.get("summary") or "")
+        checkpoints = card.get("checkpoints") or []
+        if checkpoints:
+            lines.append("")
+            lines.append("复核要点：")
+            lines.extend(f"- {item}" for item in checkpoints)
+        source_refs = card.get("source_refs") or []
+        if source_refs:
+            lines.append("")
+            lines.append("参考来源：")
+            lines.extend(f"- {item}" for item in source_refs[:6])
+        lines.append("")
+    lines.append("## 任务拆解经验")
+    for task in payload.get("task_breakdown", []):
+        lines.append(
+            f"- {task.get('task_name', '')}：{task.get('owner_role', '')}，优先级 {task.get('priority', '')}，交付物：{task.get('output_requirement', '')}"
+        )
+    lines.extend(["", "## 风险与待确认问题"])
+    lines.extend(f"- 风险：{item}" for item in payload.get("risk_list", []))
+    lines.extend(f"- 待确认：{item}" for item in payload.get("open_questions", []))
+    lines.extend(["", "## 原始引用来源"])
+    for ref in payload.get("source_refs", [])[:12]:
+        source = ref.get("source_path") or ref.get("source_file") or "未命名来源"
+        quote = ref.get("quote") or ""
+        lines.append(f"- {source}：{quote[:160]}")
+    return "\n".join(lines).strip() + "\n"
+
+
+def deposit_startup_analysis_to_knowledge(
+    db: Session,
+    project: models.Project,
+    payload: dict[str, Any],
+    report_id: str,
+) -> models.KnowledgeFile:
+    title = f"{project.name} 项目分析沉淀"
+    indexed_path = f"project-deposits/{project.id}/startup-analysis.md"
+    tags = ["项目沉淀", "启动分析", project.name, project.city, project.project_type, project.phase]
+    markdown = startup_analysis_deposit_markdown(project, payload, report_id)
+    record = upsert_knowledge_markdown(db, indexed_path, title, markdown, [tag for tag in tags if tag])
+    db.flush()
+    return record
+
+
+def save_startup_analysis(
+    db: Session,
+    project: models.Project,
+    payload: dict[str, Any],
+    analyzed_files: Optional[list[models.ProjectFile]] = None,
+) -> models.ProjectReport:
+    db.execute(
+        delete(models.ProjectReport).where(
+            models.ProjectReport.project_id == project.id,
+            models.ProjectReport.report_type == "startup_analysis",
+        )
+    )
+    db.execute(delete(models.KnowledgeReference).where(models.KnowledgeReference.project_id == project.id))
+    report = models.ProjectReport(
+        project_id=project.id,
+        report_type="startup_analysis",
+        content_json=json.dumps(payload, ensure_ascii=False),
+        markdown=startup_analysis_to_markdown(payload),
+        model_name=settings.deepseek_model if not settings.mock_mode else "mock",
+        mode=payload.get("mode", "mock"),
+    )
+    db.add(report)
+    for ref in payload.get("source_refs", [])[:12]:
+        db.add(
+            models.KnowledgeReference(
+                project_id=project.id,
+                source_file=ref.get("source_file", ""),
+                source_path=ref.get("source_path", ""),
+                chunk_id=ref.get("chunk_id", ""),
+                quote=ref.get("quote", ""),
+                relevance_score=float(ref.get("relevance_score") or 0),
+            )
+        )
+    existing_task_names = {task.task_name for task in project.tasks}
+    for item in payload.get("task_breakdown", []):
+        if item["task_name"] in existing_task_names:
+            continue
+        db.add(
+            models.ProjectTask(
+                project_id=project.id,
+                task_name=item["task_name"],
+                task_type=item["task_type"],
+                priority=item["priority"],
+                owner_role=item["owner_role"],
+                estimated_days=int(item["estimated_days"]),
+                dependencies=json.dumps(item.get("dependencies", []), ensure_ascii=False),
+                risk_level=item["risk_level"],
+                status=item["status"],
+                output_requirement=item["output_requirement"],
+            )
+        )
+    agenda_markdown = "# 项目启动会议程\n\n" + "\n".join(f"{idx}. {item}" for idx, item in enumerate(payload["meeting_agenda"], start=1))
+    if not project.meetings:
+        db.add(
+            models.Meeting(
+                project_id=project.id,
+                title=f"{project.name} 项目启动会",
+                agenda=agenda_markdown,
+                status="scheduled",
+                mindmap_json=json.dumps(payload["mindmap_json"], ensure_ascii=False),
+                next_actions_json=json.dumps(payload["task_breakdown"], ensure_ascii=False),
+            )
+        )
+    _upsert_startup_skill_card(
+        db,
+        project,
+        "technical_focus",
+        "技术重点卡",
+        "## 技术重点\n" + "\n".join(f"- **{card['dimension']}**：{card['summary']}" for card in payload["technical_focus_cards"]),
+        {"cards": payload["technical_focus_cards"]},
+    )
+    _upsert_startup_skill_card(
+        db,
+        project,
+        "task_breakdown",
+        "任务拆解卡",
+        "## 启动任务\n" + "\n".join(f"- {task['task_name']}（{task['owner_role']}）" for task in payload["task_breakdown"]),
+        {"items": payload["task_breakdown"]},
+    )
+    _upsert_startup_skill_card(
+        db,
+        project,
+        "meeting_agenda",
+        "会议议程卡",
+        agenda_markdown,
+        {"items": payload["meeting_agenda"]},
+    )
+    _upsert_startup_skill_card(
+        db,
+        project,
+        "ppt_outline",
+        "PPT结构卡",
+        "## PPT结构\n" + "\n".join(f"{item['page']}. {item['title']}：{item['content']}" for item in payload["ppt_outline"]),
+        {"slides": payload["ppt_outline"]},
+    )
+    sources = [ref.get("source_path", "") for ref in payload.get("source_refs", [])]
+    db.execute(
+        delete(models.KnowledgeItem).where(
+            models.KnowledgeItem.project_id == project.id,
+            models.KnowledgeItem.item_type == "obsidian_candidate",
+        )
+    )
+    for card in payload.get("technical_focus_cards", []):
+        db.add(
+            models.KnowledgeItem(
+                project_id=project.id,
+                source_file=card["title"],
+                item_type="obsidian_candidate",
+                summary=card["summary"],
+                tags=json.dumps(["技术卡", card["dimension"], "候选"], ensure_ascii=False),
+                content=_candidate_markdown(card["title"], card["summary"], sources),
+            )
+        )
+    batch_id = uuid4().hex
+    for file in analyzed_files or []:
+        file.analysis_status = "analyzed"
+        file.analysis_batch_id = batch_id
+        file.analyzed_at = datetime.utcnow()
+    db.flush()
+    deposit_startup_analysis_to_knowledge(db, project, payload, report.id)
+    db.commit()
+    db.refresh(report)
+    return report
+
+
+async def run_startup_analysis(db: Session, project: models.Project) -> dict[str, Any]:
+    question = " ".join(
+        [
+            project.name,
+            project.city,
+            project.project_type,
+            project.phase,
+            project.description,
+            "日照 退界 面积计算 消防 规划条件 报批 强排 会议纪要",
+        ]
+    )
+    chunks = search_knowledge(db, question, limit=10)
+    analysis_files = pending_analysis_files(project)
+    fallback_payload = build_startup_analysis_payload(project, chunks)
+    if analysis_files:
+        fallback_payload["analysis_scope"] = {
+            "mode": "pending_files_only",
+            "file_count": len(analysis_files),
+            "filenames": [file.filename for file in analysis_files],
+        }
+    payload = fallback_payload
+    if not settings.mock_mode:
+        try:
+            deepseek_payload = await call_deepseek_json(build_startup_analysis_prompt(project, chunks, files=analysis_files))
+            if deepseek_payload:
+                payload = normalize_startup_analysis_payload(deepseek_payload, fallback_payload)
+                payload["mode"] = "deepseek"
+            else:
+                payload["mode"] = "deepseek_error"
+        except Exception as exc:
+            payload["mode"] = "deepseek_error"
+            payload["error_message"] = f"DeepSeek 调用失败，已回退本地分析：{exc}"
+    report = save_startup_analysis(db, project, payload, analyzed_files=analysis_files)
+    return {"report": report, **payload}
+
+
+def build_project_execution_prompt(project: models.Project, instruction: str, chunks: list[models.KnowledgeChunk]) -> str:
+    latest_report = next((report for report in sorted(project.reports, key=lambda item: item.created_at, reverse=True)), None)
+    context = {
+        "project": {
+            "name": project.name,
+            "city": project.city,
+            "project_type": project.project_type,
+            "phase": project.phase,
+            "description": project.description,
+            "status": project.status,
+        },
+        "latest_report": (latest_report.markdown[:3000] if latest_report and latest_report.markdown else ""),
+        "tasks": [
+            {
+                "task_name": task.task_name,
+                "owner_role": task.owner_role,
+                "priority": task.priority,
+                "risk_level": task.risk_level,
+                "status": task.status,
+                "output_requirement": task.output_requirement,
+            }
+            for task in project.tasks[:20]
+        ],
+        "meetings": [
+            {
+                "title": meeting.title,
+                "agenda": (meeting.agenda or "")[:800],
+                "summary": (meeting.summary or "")[:1200],
+                "status": meeting.status,
+            }
+            for meeting in project.meetings[:8]
+        ],
+        "knowledge_references": [
+            {
+                "source_file": ref.source_file,
+                "source_path": ref.source_path,
+                "quote": ref.quote[:500],
+            }
+            for ref in project.knowledge_references[:10]
+        ],
+        "retrieved_knowledge": [
+            {
+                "path": chunk.path,
+                "heading": chunk.heading,
+                "content": chunk.content[:900],
+            }
+            for chunk in chunks
+        ],
+    }
+    return (
+        "你是建筑设计项目执行助手。请基于项目上下文、本地知识库检索结果和用户指令执行工作。\n"
+        "要求：\n"
+        "1. 必须优先使用项目上下文和知识库内容，不要编造来源。\n"
+        "2. 输出要能直接服务项目推进，包含判断、拆解、风险和下一步建议。\n"
+        "3. 如果适合转成任务，请列出任务名、负责人角色、优先级和交付物。\n"
+        "4. 最后列出使用到的知识库来源路径。\n\n"
+        f"用户指令：{instruction}\n\n"
+        "项目执行上下文：\n"
+        f"{json.dumps(context, ensure_ascii=False, indent=2)}"
+    )
+
+
+async def run_project_execution(db: Session, project: models.Project, instruction: str) -> models.AgentRun:
+    query = " ".join([project.name, project.city, project.project_type, project.phase, instruction])
+    chunks = search_knowledge(db, query, limit=8)
+    prompt = build_project_execution_prompt(project, instruction, chunks)
+    mode = "mock" if settings.mock_mode else "deepseek"
+    try:
+        if settings.mock_mode:
+            answer = (
+                f"【Mock模式】已读取 {project.name} 的项目上下文，并检索到 {len(chunks)} 条知识库片段。\n\n"
+                f"针对“{instruction}”，建议先围绕资料缺口、技术风险、任务责任人和交付物四类事项拆解。\n\n"
+                "## 下一步建议\n"
+                "- 明确本轮要解决的关键技术问题。\n"
+                "- 对照知识库历史项目经验形成复核清单。\n"
+                "- 将结论转为任务或沉淀为项目知识。"
+            )
+        else:
+            answer = await call_deepseek_text(
+                prompt=prompt,
+                system_prompt="你是建筑设计项目执行助手。只基于项目上下文和本地知识库回答，输出中文 Markdown。",
+            )
+    except Exception as exc:
+        mode = "deepseek_error"
+        answer = (
+            "DeepSeek 调用失败，已回退为本地执行摘要。\n\n"
+            f"- 指令：{instruction}\n"
+            f"- 已检索知识片段：{len(chunks)} 条\n"
+            f"- 错误类型：{exc.__class__.__name__}\n\n"
+            "建议稍后重试，或先基于当前项目任务和会议纪要手动推进。"
+        )
+    output = {
+        "mode": mode,
+        "answer": answer,
+        "references": [
+            {
+                "chunk_id": chunk.id,
+                "source_path": chunk.path,
+                "heading": chunk.heading,
+                "quote": chunk.content[:420],
+            }
+            for chunk in chunks
+        ],
+    }
+    run = models.AgentRun(
+        project_id=project.id,
+        agent_id="project-execution",
+        input_context=json.dumps({"instruction": instruction, "prompt": prompt}, ensure_ascii=False),
+        output_json=json.dumps(output, ensure_ascii=False),
+        status="succeeded" if mode != "deepseek_error" else "failed",
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def build_team_plan(db: Session, project: models.Project) -> models.TeamPlan:
+    employees = list(db.scalars(select(models.DigitalEmployee)))
+    tasks = project.tasks
+    role_tasks: dict[str, list[str]] = defaultdict(list)
+    for task in tasks:
+        role_tasks[task.owner_role or "AI项目经理"].append(task.task_name)
+    roles = []
+    for employee in employees:
+        matched = role_tasks.get(employee.name) or role_tasks.get(employee.role) or []
+        if matched or employee.name in {"AI项目经理", "AI资料管理员", "AI汇报助理"}:
+            roles.append(
+                {
+                    "name": employee.name,
+                    "role": employee.role,
+                    "recommended_count": 1,
+                    "tasks": matched[:6],
+                    "skills": json.loads(employee.skills or "[]"),
+                    "intensity": "高" if matched else "中",
+                    "risk_note": "需要人工确认任务边界和交付标准。",
+                }
+            )
+    if not roles:
+        roles = [
+            {
+                "name": "AI项目经理",
+                "role": "项目负责人 / PM",
+                "recommended_count": 1,
+                "tasks": [],
+                "skills": ["任务拆解"],
+                "intensity": "中",
+                "risk_note": "Mock 规则生成。",
+            }
+        ]
+    plan = models.TeamPlan(
+        project_id=project.id,
+        recommended_roles=json.dumps(roles, ensure_ascii=False),
+        staffing_summary=f"建议 {len(roles)} 类数字员工参与；需要根据真实任务继续校准投入强度。",
+    )
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def default_meeting_agenda(project: models.Project) -> str:
+    return "\n".join(
+        [
+            f"# {project.name} 项目启动会议程",
+            "1. 确认项目背景、业主诉求与当前设计阶段。",
+            "2. 核对规划条件、红线、日照、退界、面积计算等技术资料缺口。",
+            "3. 复盘历史相似项目可复用经验和风险清单。",
+            "4. 明确本轮交付物、节点时间和责任人。",
+            "5. 确认下一次业主沟通需要决策的问题。",
+        ]
+    )
+
+
+def summarize_meeting(db: Session, meeting: models.Meeting) -> models.Meeting:
+    project = db.get(models.Project, meeting.project_id)
+    project_name = project.name if project else "当前项目"
+    transcript = meeting.transcript.strip()
+    basis = transcript or meeting.agenda
+    if not basis and project:
+        basis = default_meeting_agenda(project)
+    actions = [
+        {"title": "补齐规划条件、红线、日照和退界资料", "owner": "项目经理", "status": "todo"},
+        {"title": "整理历史相似项目技术复用卡", "owner": "AI资料管理员", "status": "todo"},
+        {"title": "输出本轮任务拆解和PPT结构", "owner": "AI汇报助理", "status": "todo"},
+    ]
+    meeting.summary = (
+        f"# {project_name} 会议纪要\n\n"
+        "## 核心结论\n"
+        "- 本轮会议重点围绕项目启动、资料缺口、技术边界和下一步分工展开。\n"
+        "- 需要优先确认日照、退界、面积计算、消防/报批等基础约束。\n"
+        "- AI 将把会议结论转化为任务看板和后续汇报结构。\n\n"
+        "## 原始记录摘要\n"
+        f"{basis[:1600] or '暂无会议记录，已按启动会议程生成纪要。'}\n\n"
+        "## 下一步\n"
+        + "\n".join(f"- {item['title']}（{item['owner']}）" for item in actions)
+    )
+    meeting.mindmap_json = json.dumps(
+        {
+            "name": project_name,
+            "children": [
+                {"name": "资料缺口", "children": [{"name": "规划条件"}, {"name": "日照退界"}, {"name": "面积计算"}]},
+                {"name": "任务推进", "children": [{"name": "任务拆解"}, {"name": "责任人"}, {"name": "节点计划"}]},
+                {"name": "汇报准备", "children": [{"name": "PPT结构"}, {"name": "风险问题"}, {"name": "业主决策"}]},
+            ],
+        },
+        ensure_ascii=False,
+    )
+    meeting.next_actions_json = json.dumps(actions, ensure_ascii=False)
+    meeting.status = "summarized"
+    db.commit()
+
+    existing_names = {task.task_name for task in project.tasks} if project else set()
+    if project:
+        for item in actions:
+            if item["title"] in existing_names:
+                continue
+            db.add(
+                models.ProjectTask(
+                    project_id=project.id,
+                    task_name=item["title"],
+                    task_type="会议待办",
+                    priority="高",
+                    owner_role=item["owner"],
+                    estimated_days=2,
+                    dependencies="[]",
+                    risk_level="中",
+                    status="todo",
+                    output_requirement="来自会议纪要自动生成，需要项目经理确认。",
+                )
+            )
+        db.commit()
+    db.refresh(meeting)
+    return meeting
+
+
+def run_skill_card(db: Session, project: models.Project, card_type: str, prompt: str = "") -> models.SkillCard:
+    card_names = {
+        "task_breakdown": "任务拆解卡",
+        "technical_focus": "技术重点卡",
+        "meeting_minutes": "会议纪要/待办卡",
+        "ppt_outline": "PPT结构卡",
+    }
+    card_type = card_type if card_type in card_names else "task_breakdown"
+    tasks = [task.task_name for task in project.tasks[:8]]
+    refs = [ref.source_file for ref in project.knowledge_references[:6]]
+    meetings = [meeting.title for meeting in project.meetings[:5]]
+    outputs: dict[str, Any] = {
+        "task_breakdown": {
+            "items": tasks
+            or ["资料完整性检查", "技术边界复核", "竞品案例收集", "PPT汇报结构搭建"],
+            "next": "将任务分配给真实成员或AI数字员工。",
+        },
+        "technical_focus": {
+            "cards": ["日照计算方式", "退界要求", "面积计算方式", "消防/报批风险", "规划条件复核"],
+            "knowledge_sources": refs or ["待扫描知识库后自动引用来源"],
+        },
+        "meeting_minutes": {
+            "meetings": meetings or ["项目启动会"],
+            "next_actions": ["补齐资料", "确认关键技术边界", "准备下次业主会"],
+        },
+        "ppt_outline": {
+            "slides": ["封面", "项目背景", "技术边界", "历史案例复用", "任务拆解", "风险与下一步"],
+            "tone": "面向业主沟通，结论清晰、风险前置、任务可执行。",
+        },
+    }
+    markdown = f"# {card_names[card_type]}\n\n"
+    if prompt:
+        markdown += f"## 用户需求\n{prompt}\n\n"
+    if card_type == "task_breakdown":
+        markdown += "## 建议任务\n" + "\n".join(f"- {item}" for item in outputs[card_type]["items"])
+    elif card_type == "technical_focus":
+        markdown += "## 技术复用重点\n" + "\n".join(f"- {item}" for item in outputs[card_type]["cards"])
+        markdown += "\n\n## 来源\n" + "\n".join(f"- {item}" for item in outputs[card_type]["knowledge_sources"])
+    elif card_type == "meeting_minutes":
+        markdown += "## 会议推进\n" + "\n".join(f"- {item}" for item in outputs[card_type]["next_actions"])
+    else:
+        markdown += "## PPT框架\n" + "\n".join(f"{idx + 1}. {item}" for idx, item in enumerate(outputs[card_type]["slides"]))
+
+    card = models.SkillCard(
+        project_id=project.id,
+        card_type=card_type,
+        title=card_names[card_type],
+        status="succeeded",
+        input_json=json.dumps({"prompt": prompt, "project_id": project.id}, ensure_ascii=False),
+        output_json=json.dumps(outputs[card_type], ensure_ascii=False),
+        markdown=markdown,
+        source="mock" if settings.mock_mode else "deepseek",
+    )
+    db.add(card)
+    db.commit()
+    db.refresh(card)
+    return card

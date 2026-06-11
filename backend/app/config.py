@@ -1,0 +1,58 @@
+import os
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+BASE_DIR = Path(os.environ.get("ROM_AI_BASE_DIR") or Path(__file__).resolve().parents[1]).resolve()
+ENV_FILE = Path(os.environ.get("ROM_AI_ENV_FILE") or BASE_DIR / ".env").resolve()
+
+
+class Settings(BaseSettings):
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-chat"
+    tencent_meeting_token: str = ""
+    default_vault_path: str = r"C:\Users\yz_ya\Documents\Obsidian Vault\Obj-哈尔滨"
+    upload_root: str = str(BASE_DIR / "uploads")
+    cloud_upload_enabled: bool = False
+    cloud_upload_root: str = str(BASE_DIR / "cloud")
+    database_url: str = "sqlite:///./data/rmo_ai.db"
+
+    model_config = SettingsConfigDict(
+        env_file=str(ENV_FILE),
+        env_file_encoding="utf-8-sig",
+        extra="ignore",
+    )
+
+    @property
+    def mock_mode(self) -> bool:
+        return not bool(self.deepseek_api_key.strip())
+
+    @property
+    def upload_root_path(self) -> Path:
+        path = Path(self.upload_root)
+        if not path.is_absolute():
+            return (BASE_DIR / path).resolve()
+        return path.resolve()
+
+
+settings = Settings()
+
+
+def write_env_value(key: str, value: str) -> None:
+    env_path = BASE_DIR / ".env"
+    lines = []
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8-sig").splitlines()
+    found = False
+    updated = []
+    for line in lines:
+        if line.startswith(f"{key}="):
+            updated.append(f"{key}={value}")
+            found = True
+        else:
+            updated.append(line)
+    if not found:
+        updated.append(f"{key}={value}")
+    env_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
