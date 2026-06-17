@@ -1,7 +1,15 @@
 import { useEffect, useState } from 'react';
-import { DownloadCloud, FolderOpen, Loader2, Save, ShieldCheck } from 'lucide-react';
+import { DownloadCloud, FolderOpen, Loader2, Power, RefreshCw, Save, ShieldCheck } from 'lucide-react';
 import { getSettingsStatus, listDeepSeekModels, updateDeepSeekSettings, type DeepSeekModelInfo, type SettingsStatus } from '../lib/projectsApi';
-import { openDesktopPath } from '../lib/runtime';
+import {
+  checkDesktopUpdate,
+  downloadDesktopUpdate,
+  getDesktopVersion,
+  installDesktopUpdate,
+  onDesktopUpdateStatus,
+  openDesktopPath,
+  type UpdateStatusPayload,
+} from '../lib/runtime';
 
 export function SettingsPage() {
   const [status, setStatus] = useState<SettingsStatus | null>(null);
@@ -12,6 +20,10 @@ export function SettingsPage() {
   const [models, setModels] = useState<DeepSeekModelInfo[]>([]);
   const [saving, setSaving] = useState(false);
   const [loadingModels, setLoadingModels] = useState(false);
+  const [versionInfo, setVersionInfo] = useState<{ version: string; isPackaged: boolean } | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatusPayload>({ status: 'idle' });
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [downloadingUpdate, setDownloadingUpdate] = useState(false);
 
   async function loadStatus() {
     try {
@@ -26,6 +38,14 @@ export function SettingsPage() {
 
   useEffect(() => {
     loadStatus();
+    getDesktopVersion().then((data) => {
+      if (data) setVersionInfo({ version: data.version, isPackaged: data.isPackaged });
+    });
+    onDesktopUpdateStatus((payload) => {
+      setUpdateStatus(payload);
+      setCheckingUpdate(payload.status === 'checking');
+      setDownloadingUpdate(payload.status === 'downloading');
+    });
   }, []);
 
   async function saveDeepSeekSettings() {
@@ -68,6 +88,53 @@ export function SettingsPage() {
     const opened = await openDesktopPath(key);
     if (!opened) setMessage(`${label}只能在桌面应用中直接打开。`);
   }
+
+  async function checkUpdate() {
+    setMessage('');
+    setCheckingUpdate(true);
+    try {
+      const result = await checkDesktopUpdate();
+      if (!result) setMessage('检查更新只能在桌面应用中使用。');
+    } catch (error) {
+      setMessage(`检查更新失败：${String(error)}`);
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
+  async function downloadUpdate() {
+    setMessage('');
+    setDownloadingUpdate(true);
+    try {
+      const result = await downloadDesktopUpdate();
+      if (!result) setMessage('下载更新只能在桌面应用中使用。');
+    } catch (error) {
+      setMessage(`下载更新失败：${String(error)}`);
+      setDownloadingUpdate(false);
+    }
+  }
+
+  async function installUpdate() {
+    try {
+      await installDesktopUpdate();
+    } catch (error) {
+      setMessage(`安装更新失败：${String(error)}`);
+    }
+  }
+
+  const updateLabelByStatus: Record<UpdateStatusPayload['status'], string> = {
+    idle: '等待检查',
+    checking: '正在检查更新',
+    available: '发现新版本',
+    'not-available': '已是最新版本',
+    downloading: '正在下载更新',
+    downloaded: '更新已下载',
+    error: '更新检查失败',
+    'dev-mode': '开发模式',
+  };
+
+  const updateProgress = Math.round(updateStatus.info?.percent ?? 0);
+  const updateVersion = updateStatus.info?.version;
 
   return (
     <main className="min-h-screen bg-[#0A0A0A] px-6 pb-20 pt-28 md:px-12">
@@ -185,6 +252,59 @@ export function SettingsPage() {
                 >
                   <FolderOpen size={16} />
                   打开日志目录
+                </button>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-[#333333] bg-[#111111] p-5">
+              <div className="mb-5 flex items-center gap-2 text-sm font-semibold text-white">
+                <RefreshCw size={18} className="text-sky-300" />
+                应用更新
+              </div>
+              <div className="grid grid-cols-1 gap-4 text-sm md:grid-cols-2">
+                <div className="rounded-lg bg-[#171717] p-4">当前版本：{versionInfo?.version || '未知'}</div>
+                <div className="rounded-lg bg-[#171717] p-4">运行模式：{versionInfo?.isPackaged ? '正式安装版' : '开发模式'}</div>
+                <div className="rounded-lg bg-[#171717] p-4 md:col-span-2">
+                  更新状态：{updateLabelByStatus[updateStatus.status]}
+                  {updateVersion ? ` · 最新版本 ${updateVersion}` : ''}
+                  {updateStatus.info?.message ? ` · ${updateStatus.info.message}` : ''}
+                </div>
+                {updateStatus.status === 'downloading' ? (
+                  <div className="rounded-lg bg-[#171717] p-4 md:col-span-2">
+                    <div className="mb-2 flex items-center justify-between text-xs text-zinc-400">
+                      <span>下载进度</span>
+                      <span>{updateProgress}%</span>
+                    </div>
+                    <div className="h-2 overflow-hidden rounded-full bg-black/40">
+                      <div className="h-full rounded-full bg-sky-300" style={{ width: `${updateProgress}%` }} />
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+              <div className="mt-4 flex flex-wrap gap-3">
+                <button
+                  onClick={checkUpdate}
+                  disabled={checkingUpdate || downloadingUpdate}
+                  className="inline-flex items-center gap-2 rounded-lg border border-[#333333] bg-[#171717] px-4 py-2 text-sm text-zinc-200 hover:border-zinc-600 disabled:opacity-50"
+                >
+                  {checkingUpdate ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
+                  检查更新
+                </button>
+                <button
+                  onClick={downloadUpdate}
+                  disabled={updateStatus.status !== 'available' || downloadingUpdate}
+                  className="inline-flex items-center gap-2 rounded-lg border border-[#333333] bg-[#171717] px-4 py-2 text-sm text-zinc-200 hover:border-zinc-600 disabled:opacity-50"
+                >
+                  {downloadingUpdate ? <Loader2 size={16} className="animate-spin" /> : <DownloadCloud size={16} />}
+                  下载更新
+                </button>
+                <button
+                  onClick={installUpdate}
+                  disabled={updateStatus.status !== 'downloaded'}
+                  className="inline-flex items-center gap-2 rounded-lg bg-sky-300 px-4 py-2 text-sm font-semibold text-black hover:bg-sky-200 disabled:opacity-50"
+                >
+                  <Power size={16} />
+                  重启安装
                 </button>
               </div>
             </div>

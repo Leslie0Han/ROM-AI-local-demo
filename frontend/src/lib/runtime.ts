@@ -3,11 +3,32 @@ export type RomAIRuntime = {
   paths?: Record<string, string>;
 };
 
+export type UpdateStatusPayload = {
+  status: 'idle' | 'checking' | 'available' | 'not-available' | 'downloading' | 'downloaded' | 'error' | 'dev-mode';
+  version?: string;
+  isPackaged?: boolean;
+  info?: {
+    version?: string;
+    releaseName?: string;
+    releaseDate?: string;
+    percent?: number;
+    transferred?: number;
+    total?: number;
+    bytesPerSecond?: number;
+    message?: string;
+  };
+};
+
 declare global {
   interface Window {
     romAI?: {
       getRuntime: () => Promise<RomAIRuntime>;
       openPath: (key: string) => Promise<boolean>;
+      getVersion: () => Promise<{ version: string; isPackaged: boolean; info?: Record<string, unknown> }>;
+      checkUpdate: () => Promise<unknown>;
+      downloadUpdate: () => Promise<unknown>;
+      installUpdate: () => Promise<boolean>;
+      onUpdateStatus: (callback: (payload: UpdateStatusPayload) => void) => void;
       onBackendExit: (callback: (payload: unknown) => void) => void;
     };
   }
@@ -41,4 +62,30 @@ export async function getDesktopRuntime() {
 export async function openDesktopPath(key: string) {
   if (!window.romAI) return false;
   return window.romAI.openPath(key);
+}
+
+export async function getDesktopVersion() {
+  if (!window.romAI) return null;
+  return window.romAI.getVersion();
+}
+
+export async function checkDesktopUpdate() {
+  if (!window.romAI) return null;
+  return window.romAI.checkUpdate();
+}
+
+export async function downloadDesktopUpdate() {
+  if (!window.romAI) return null;
+  return window.romAI.downloadUpdate();
+}
+
+export async function installDesktopUpdate() {
+  if (!window.romAI) return false;
+  return window.romAI.installUpdate();
+}
+
+export function onDesktopUpdateStatus(callback: (payload: UpdateStatusPayload) => void) {
+  if (!window.romAI) return false;
+  window.romAI.onUpdateStatus(callback);
+  return true;
 }

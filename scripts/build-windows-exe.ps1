@@ -97,25 +97,12 @@ if (Test-Path $Release) {
 
 Step "Building backend executable"
 Push-Location $Backend
-.\.venv-win\Scripts\pyinstaller.exe `
+.\.venv-win\Scripts\python.exe -m PyInstaller `
+  rom-ai-backend.spec `
   --noconfirm `
   --clean `
-  --name rom-ai-backend `
   --distpath $BackendDist `
-  --workpath (Join-Path $Backend "build") `
-  --specpath $Backend `
-  --collect-all pydantic `
-  --collect-all pydantic_settings `
-  --collect-all fastapi `
-  --collect-all uvicorn `
-  --collect-all sqlalchemy `
-  --collect-all dotenv `
-  --collect-all pypdf `
-  --collect-all docx `
-  --collect-all pptx `
-  --collect-all openpyxl `
-  --collect-all lxml `
-  desktop_server.py
+  --workpath (Join-Path $Backend "build")
 Pop-Location
 
 $BackendExe = Join-Path $BackendDist "rom-ai-backend\rom-ai-backend.exe"
@@ -132,8 +119,24 @@ $Installer = Get-ChildItem $Release -Filter "ROM-AI-Setup-*.exe" | Sort-Object L
 if (-not $Installer) {
   throw "Installer was not created in $Release"
 }
+$LatestYml = Join-Path $Release "latest.yml"
+$Blockmap = "$($Installer.FullName).blockmap"
 
 Step "Done"
 Write-Host "Backend exe: $BackendExe"
 Write-Host "Installer: $($Installer.FullName)"
 Write-Host "Size: $([Math]::Round($Installer.Length / 1MB, 2)) MB"
+if (Test-Path $LatestYml) {
+  Write-Host "Auto-update metadata: $LatestYml"
+} else {
+  Write-Warning "latest.yml was not found. In-app updates require uploading latest.yml to GitHub Release."
+}
+if (Test-Path $Blockmap) {
+  Write-Host "Differential update blockmap: $Blockmap"
+} else {
+  Write-Warning "Installer blockmap was not found. Uploading it is recommended for in-app updates."
+}
+Write-Host "GitHub Release assets required for in-app update:"
+Write-Host "  - $($Installer.Name)"
+Write-Host "  - $($Installer.Name).blockmap"
+Write-Host "  - latest.yml"

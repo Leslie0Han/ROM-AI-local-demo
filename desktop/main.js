@@ -1,5 +1,7 @@
 const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 const { spawn } = require('child_process');
+const log = require('electron-log');
+const { autoUpdater } = require('electron-updater');
 const http = require('http');
 const net = require('net');
 const path = require('path');
@@ -12,6 +14,24 @@ let runtimePaths = null;
 const DEFAULT_BACKEND_PORT = 8000;
 
 app.setName('ROM-AI');
+autoUpdater.logger = log;
+autoUpdater.autoDownload = false;
+
+function updateInfoPayload(info = {}) {
+  return {
+    version: app.getVersion(),
+    isPackaged: app.isPackaged,
+    info,
+  };
+}
+
+function sendUpdateStatus(status, detail = {}) {
+  const payload = { status, ...updateInfoPayload(detail) };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('update-status', payload);
+  }
+  return payload;
+}
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -189,6 +209,7 @@ function createWindow(port) {
   });
   mainWindow.webContents.once('did-finish-load', () => {
     mainWindow.webContents.send('rom-ai-runtime', runtime);
+    sendUpdateStatus(app.isPackaged ? 'idle' : 'dev-mode');
   });
 }
 
@@ -197,6 +218,58 @@ function stopBackend() {
   const child = backendProcess;
   backendProcess = null;
   if (!child.killed) child.kill();
+}
+
+function setupAutoUpdate() {
+  autoUpdater.on('checking-for-update', () => {
+    sendUpdateStatus('checking');
+  });
+
+  autoUpdater.on('update-available', (info) => {
+    sendUpdateStatus('available', info);
+  });
+
+  autoUpdater.on('update-not-available', (info) => {
+    sendUpdateStatus('not-available', info);
+  });
+
+  autoUpdater.on('download-progress', (progress) => {
+    sendUpdateStatus('downloading', progress);
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    sendUpdateStatus('downloaded', info);
+  });
+
+  autoUpdater.on('error', (error) => {
+    sendUpdateStatus('error', { message: String(error && error.message ? error.message : error) });
+  });
+}
+
+async function checkForUpdates() {
+  if (!app.isPackaged) {
+    return sendUpdateStatus('dev-mode', { message: '开发模式下不检查 GitHub Release 更新。' });
+  }
+  sendUpdateStatus('checking');
+  const result = await autoUpdater.checkForUpdates();
+  return updateInfoPayload(result?.updateInfo || {});
+}
+
+async function downloadUpdate() {
+  if (!app.isPackaged) {
+    return sendUpdateStatus('dev-mode', { message: '开发模式下不能下载更新。' });
+  }
+  sendUpdateStatus('downloading');
+  await autoUpdater.downloadUpdate();
+  return updateInfoPayload();
+}
+
+function installUpdate() {
+  if (!app.isPackaged) {
+    return sendUpdateStatus('dev-mode', { message: '开发模式下不能安装更新。' });
+  }
+  autoUpdater.quitAndInstall(false, true);
+  return true;
 }
 
 ipcMain.handle('rom-ai:get-runtime', () => ({
@@ -214,8 +287,14 @@ ipcMain.handle('rom-ai:open-path', async (_event, key) => {
   return true;
 });
 
+ipcMain.handle('rom-ai:get-version', () => updateInfoPayload());
+ipcMain.handle('rom-ai:check-update', checkForUpdates);
+ipcMain.handle('rom-ai:download-update', downloadUpdate);
+ipcMain.handle('rom-ai:install-update', installUpdate);
+
 app.whenReady().then(async () => {
   try {
+    setupAutoUpdate();
     const port = await startBackend();
     process.env.ROM_AI_BACKEND_PORT = String(port);
     createWindow(port);

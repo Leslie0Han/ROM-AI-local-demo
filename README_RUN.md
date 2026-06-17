@@ -2,7 +2,7 @@
 
 ## 安装与启动
 
-1. 双击 `release\ROM-AI-Setup-1.0.0.exe` 安装。
+1. 双击 `release\ROM-AI-Setup-1.0.1.exe` 安装。
 2. 安装完成后，从桌面快捷方式或开始菜单启动 `ROM-AI`。
 3. 首次启动会自动创建本机用户数据目录，不需要手动启动前端或后端。
 
@@ -36,6 +36,17 @@
 
 配置会写入当前 Windows 用户的 AppData `.env`，不会写入安装目录。未配置 API Key 时，部分 AI 功能会使用 mock 模式或给出明确提示。
 
+## 应用内更新
+
+从 `1.0.1` 开始，应用可以在“系统设置”页面检查 GitHub Releases 上的新版本。
+
+1. 打开“系统设置”。
+2. 点击“检查更新”。
+3. 如发现新版本，点击“下载更新”。
+4. 下载完成后点击“重启安装”。
+
+开发模式下不会检查更新。发布新版时必须在 GitHub Release 中同时上传安装包、`.blockmap` 和 `latest.yml`，否则客户端无法自动检测或下载更新。
+
 ## 构建安装包
 
 在项目根目录运行：
@@ -59,7 +70,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows-exe.
 构建输出：
 
 ```text
-release\ROM-AI-Setup-1.0.0.exe
+release\ROM-AI-Setup-1.0.1.exe
 release\win-unpacked\ROM-AI.exe
 ```
 

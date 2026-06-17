@@ -1,6 +1,6 @@
 {
   "name": "rom-ai-desktop",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "ROM-AI local desktop application",
   "author": "ROM-AI",
   "main": "main.js",
@@ -11,6 +11,8 @@
   },
   "dependencies": {
     "electron-is-dev": "^3.0.1",
+    "electron-log": "^5.4.4",
+    "electron-updater": "^6.8.9",
     "wait-on": "^8.0.1"
   },
   "devDependencies": {
@@ -60,6 +62,13 @@
       ],
       "artifactName": "ROM-AI-Setup-${version}.${ext}"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Leslie0Han",
+        "repo": "ROM-AI-local-demo"
+      }
+    ],
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
