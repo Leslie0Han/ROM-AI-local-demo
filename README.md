@@ -45,7 +45,13 @@ http://127.0.0.1:5175/projects
 
 ## Windows 安装包打包
 
-如需生成可下载安装的 Windows `.exe` 安装包，请在 Windows 10/11 x64 上运行：
+可在 GitHub Releases 下载 Windows 安装包：
+
+```text
+https://github.com/Leslie0Han/ROM-AI-local-demo/releases
+```
+
+如需本地重新生成 Windows `.exe` 安装包，请在 Windows 10/11 x64 上运行：
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
@@ -64,13 +70,13 @@ release/ROM-AI-Setup-1.0.0.exe
 scripts/README-Windows-Exe.md
 ```
 
-## 未上传内容
+## 本地私有数据
 
-以下内容属于本地运行产物或敏感信息，已通过 `.gitignore` 排除：
+以下内容属于每台电脑自己的运行数据、依赖缓存或敏感配置，不应提交到 GitHub，也不会进入发布安装包：
 
 - `.env`
 - SQLite 数据库
 - 上传资料
 - `node_modules`
 - `dist`
-- 缓存、日志、临时文件
+- 构建缓存、日志、临时文件
