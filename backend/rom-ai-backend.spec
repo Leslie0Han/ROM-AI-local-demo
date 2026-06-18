@@ -9,7 +9,7 @@ def collect_tree(source, prefix):
     return [
         (str(path), str(Path(prefix) / path.relative_to(root).parent))
         for path in root.rglob('*')
-        if path.is_file()
+        if path.is_file() and "__pycache__" not in path.parts
     ]
 
 

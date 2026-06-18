@@ -133,6 +133,7 @@ def resolve_tencent_meeting_skill_dir() -> Path:
         TENCENT_MEETING_SKILL_DIR,
         Path(getattr(sys, "_MEIPASS", "")) / "vendor" / TENCENT_MEETING_SKILL_DIRNAME if getattr(sys, "_MEIPASS", None) else None,
         Path(sys.executable).resolve().parent / "vendor" / TENCENT_MEETING_SKILL_DIRNAME if getattr(sys, "frozen", False) else None,
+        Path(sys.executable).resolve().parent / "_internal" / "vendor" / TENCENT_MEETING_SKILL_DIRNAME if getattr(sys, "frozen", False) else None,
         TENCENT_MEETING_USER_SKILL_DIR,
     ]
     for candidate in candidates:
