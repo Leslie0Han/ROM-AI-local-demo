@@ -8,7 +8,8 @@ from sqlalchemy.orm import sessionmaker
 
 from app import models, schemas
 from app.database import Base
-from app.services import delete_project_library, search_knowledge, summarize_meeting
+from app.config import settings
+from app.services import call_tencent_meeting_tool, delete_project_library, resolve_tencent_meeting_skill_dir, search_knowledge, summarize_meeting
 from app.routes.projects import assign_project_task, create_project_meeting, create_project_task, delete_project_execution_run, delete_project_file, delete_project_meeting, delete_project_task, parse_one_project_file, preview_project_file, sync_tencent_project_meeting_minutes, update_project_task
 from app.routes.team import (
     add_team_member,
@@ -111,6 +112,42 @@ class ProjectTeamWorkflowTest(unittest.TestCase):
         finally:
             project_routes.sync_tencent_meeting_minutes = original_sync
             db.close()
+
+    def test_tencent_meeting_skill_is_bundled_with_backend(self):
+        skill_dir = resolve_tencent_meeting_skill_dir()
+
+        self.assertEqual(skill_dir.name, "tencent-meeting-mcp")
+        self.assertTrue((skill_dir / "scripts" / "mcp_proxy.py").exists())
+        self.assertTrue((skill_dir / "config.json").exists())
+
+    def test_tencent_meeting_tool_uses_user_token_without_external_python(self):
+        import urllib.request
+
+        original_token = settings.tencent_meeting_token
+        original_urlopen = urllib.request.urlopen
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return (
+                    b'{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"meeting_code: 123456789"}]}}'
+                )
+
+        try:
+            settings.tencent_meeting_token = "token-for-test"
+            urllib.request.urlopen = lambda _request: FakeResponse()
+
+            output = call_tencent_meeting_tool("schedule_meeting", {"subject": "测试会议"}, timeout=1)
+
+            self.assertIn("meeting_code: 123456789", output)
+        finally:
+            settings.tencent_meeting_token = original_token
+            urllib.request.urlopen = original_urlopen
 
     def test_meeting_summary_requires_real_transcript(self):
         db = self.open_temp_db()

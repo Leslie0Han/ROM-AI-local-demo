@@ -3,7 +3,8 @@ import os
 import re
 import hashlib
 import shutil
-import subprocess
+import socket
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -20,7 +21,9 @@ from sqlalchemy.orm import Session
 from app import models
 from app.config import settings
 
-TENCENT_MEETING_SCRIPT = Path.home() / ".codex" / "skills" / "tencent-meeting-mcp" / "scripts" / "tencent_meeting.py"
+TENCENT_MEETING_SKILL_DIRNAME = "tencent-meeting-mcp"
+TENCENT_MEETING_SKILL_DIR = Path(__file__).resolve().parents[1] / "vendor" / TENCENT_MEETING_SKILL_DIRNAME
+TENCENT_MEETING_USER_SKILL_DIR = Path.home() / ".codex" / "skills" / TENCENT_MEETING_SKILL_DIRNAME
 
 
 class TencentMinutesUnavailableError(RuntimeError):
@@ -123,6 +126,57 @@ def _tencent_response_error(text: str) -> str:
     if isinstance(headers, dict):
         trace = str(headers.get("X-Tc-Trace") or headers.get("rpcUuid") or "")
     return "；".join(part for part in [message or f"腾讯会议接口返回 {status_code}", f"trace={trace}" if trace else ""] if part)
+
+
+def resolve_tencent_meeting_skill_dir() -> Path:
+    candidates = [
+        TENCENT_MEETING_SKILL_DIR,
+        Path(getattr(sys, "_MEIPASS", "")) / "vendor" / TENCENT_MEETING_SKILL_DIRNAME if getattr(sys, "_MEIPASS", None) else None,
+        Path(sys.executable).resolve().parent / "vendor" / TENCENT_MEETING_SKILL_DIRNAME if getattr(sys, "frozen", False) else None,
+        TENCENT_MEETING_USER_SKILL_DIR,
+    ]
+    for candidate in candidates:
+        if candidate and (candidate / "scripts" / "mcp_proxy.py").exists() and (candidate / "config.json").exists():
+            return candidate
+    raise RuntimeError("腾讯会议 skill 未安装")
+
+
+def _load_tencent_meeting_config(skill_dir: Path) -> dict[str, Any]:
+    config_path = skill_dir / "config.json"
+    if not config_path.exists():
+        raise RuntimeError(f"腾讯会议 skill 配置文件不存在：{config_path}")
+    return json.loads(config_path.read_text(encoding="utf-8"))
+
+
+def _call_tencent_meeting_bundled_tool(token: str, method: str, params: dict[str, Any], timeout: int) -> str:
+    skill_dir = resolve_tencent_meeting_skill_dir()
+    scripts_dir = skill_dir / "scripts"
+    scripts_dir_str = str(scripts_dir)
+    if scripts_dir_str not in sys.path:
+        sys.path.insert(0, scripts_dir_str)
+
+    from mcp_proxy import McpProxy
+
+    config = _load_tencent_meeting_config(skill_dir)
+    proxy = McpProxy(token, str(config.get("baseUrl") or ""), str(config.get("version") or ""))
+    previous_timeout = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(timeout)
+        result = proxy.request(method, params)
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
+    if method == "tools/call" and "result" in result:
+        inner = result["result"]
+        if "error" in inner:
+            error = inner["error"]
+            return f"[错误] {error.get('message') or json.dumps(error, ensure_ascii=False)}"
+        if "content" in inner:
+            return "\n".join(
+                str(item.get("text", ""))
+                for item in inner["content"]
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 def extract_tencent_transcript_text(text: str) -> str:
@@ -283,27 +337,18 @@ def call_tencent_meeting_tool(name: str, arguments: dict[str, Any], timeout: int
     token = (settings.tencent_meeting_token or os.environ.get("TENCENT_MEETING_TOKEN", "")).strip()
     if not token:
         raise RuntimeError("TENCENT_MEETING_TOKEN 未配置")
-    if not TENCENT_MEETING_SCRIPT.exists():
-        raise RuntimeError("腾讯会议 skill 未安装")
     payload = {
         "name": name,
         "arguments": {
             **arguments,
-            "_client_info": {"os": "macos", "agent": "codex-rom-ai", "model": "gpt-5-codex"},
+            "_client_info": {"os": "windows", "agent": "rom-ai-desktop", "model": "rom-ai"},
         },
     }
-    result = subprocess.run(
-        ["python3", str(TENCENT_MEETING_SCRIPT), "tools/call", json.dumps(payload, ensure_ascii=False)],
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        env={**os.environ, "TENCENT_MEETING_TOKEN": token},
-    )
-    output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+    output = _call_tencent_meeting_bundled_tool(token, "tools/call", payload, timeout)
     response_error = _tencent_response_error(output)
     if response_error:
         raise RuntimeError(response_error)
-    if result.returncode != 0 or "[错误]" in output:
+    if "[错误]" in output:
         raise RuntimeError(output.strip() or "腾讯会议创建失败")
     return output
 
